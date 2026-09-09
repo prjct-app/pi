@@ -36,6 +36,65 @@ const stubCtx = (cwd: string, notices: string[]) => ({
   ui: { notify: (text: string) => notices.push(text), setStatus: () => undefined },
 });
 
+test('headless commands keep the user informed: every command and job lifecycle event reaches stderr', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'prjct-headless-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'client'), agentHome = join(root, 'agent');
+  await mkdir(cwd); await mkdir(agentHome);
+  await writeFile(join(cwd, 'README.md'), '# Client\n');
+  const previousEnv = { ...process.env };
+  process.env.PI_CODING_AGENT_DIR = agentHome;
+  process.env.PRJCT_HOME = join(root, 'store');
+  process.env.PRJCT_PI_COMMAND = `${process.execPath} ${fileURLToPath(new URL('./fake-pi.mjs', import.meta.url))}`;
+  t.after(() => { process.env = previousEnv; });
+
+  const host = stubHost();
+  prjctExtension(host.pi);
+  const notices: string[] = [];
+  const ctx = { ...stubCtx(cwd, notices), mode: 'print' as const };
+  const run = (args: string) => host.commands.get('prjct')!(args, ctx);
+
+  const errLines: string[] = [];
+  const originalConsoleError = console.error;
+  console.error = (...values: unknown[]) => { errLines.push(values.map(String).join(' ')); };
+  t.after(() => { console.error = originalConsoleError; });
+  const errText = () => errLines.join('\n');
+
+  await run('status');
+  assert.match(errLines.at(-1) ?? '', /No bound project\. Run \/prjct init first\./);
+  assert.equal(notices.length, 0, 'headless mode never calls the no-op UI');
+
+  await run('init');
+  assert.match(errText(), /Project initialized\. Connected project p_[0-9a-f]+ .*Queued: index, stack, history\./);
+  assert.match(errText(), /prjct index…/);
+  assert.match(errText(), /prjct index done \([\d.]+s\):/);
+  assert.match(errText(), /prjct: 3 service\(s\) finished\. \/prjct status/);
+
+  await run('status');
+  assert.match(errLines.at(-1) ?? '', /index\s+done/);
+
+  // A failing service is reported where the user can see it, not only appended.
+  process.env.FAKE_PI_MODE = 'fail';
+  await run('analyze');
+  assert.match(errText(), /prjct purpose failed: child pi exited 3/);
+  assert.match(errText(), /prjct patterns failed: child pi exited 3/);
+  delete process.env.FAKE_PI_MODE;
+
+  await run('run nope');
+  assert.match(errLines.at(-1) ?? '', /Unknown service "nope"/);
+  await run('export');
+  assert.match(errLines.at(-1) ?? '', /^Usage: \/prjct export <path>/);
+  await run('work');
+  assert.match(errLines.at(-1) ?? '', /No work yet\. \/prjct work "title" starts a cycle\./);
+  await run('ship');
+  assert.ok((errLines.at(-1) ?? '').length > 0, 'ship always answers');
+  await run('bogus');
+  assert.match(errLines.at(-1) ?? '', /^Usage:/);
+  assert.equal(notices.length, 0, 'no headless feedback was lost to the no-op UI');
+
+  for (const handler of host.handlers.get('session_shutdown') ?? []) await handler({}, ctx);
+});
+
 test('/prjct init connects and runs services without prompting the model; status, run and analyze behave', async t => {
   const root = await mkdtemp(join(tmpdir(), 'prjct-cmd-'));
   t.after(() => rm(root, { recursive: true, force: true }));
