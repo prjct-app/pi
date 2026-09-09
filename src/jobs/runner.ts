@@ -30,7 +30,7 @@ export type RunnerEvent =
   | { type: 'progress'; id: string; done: number; total: number }
   | { type: 'finished'; id: string; summary: string; durationMs: number }
   | { type: 'failed'; id: string; error: string }
-  | { type: 'idle'; ran: number };
+  | { type: 'idle'; ran: number; ids: string[] };
 
 const LOCK_STALE_MS = 30_000;
 const now = (): string => new Date().toISOString();
@@ -194,6 +194,7 @@ export class JobRunner {
 
   private async drain(signal: AbortSignal): Promise<void> {
     let ran = 0;
+    const ids: string[] = [];
     while (!signal.aborted) {
       const row = await this.claim(signal);
       if (!row) break;
@@ -206,6 +207,7 @@ export class JobRunner {
         const durationMs = Date.now() - started;
         await this.settle(row.id, { status: 'done', finishedAt: now(), durationMs, summary: outcome.summary, freshness: outcome.freshness, error: undefined as unknown as string });
         ran += 1;
+        ids.push(row.id);
         this.onEvent({ type: 'finished', id: row.id, summary: outcome.summary, durationMs });
       } catch (error) {
         const message = (error as Error).message ?? String(error);
@@ -216,7 +218,7 @@ export class JobRunner {
         this.currentId = undefined;
       }
     }
-    this.onEvent({ type: 'idle', ran });
+    this.onEvent({ type: 'idle', ran, ids });
   }
 }
 

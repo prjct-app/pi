@@ -74,7 +74,7 @@ export default function prjctExtension(pi: ExtensionAPI) {
         report(ctx, `prjct ${event.id} failed: ${event.error}`, 'warning');
       } else if (event.type === 'idle') {
         status(undefined);
-        if (event.ran > 0 && (ctx.hasUI || headless(ctx))) report(ctx, `prjct: ${event.ran} service(s) finished. /prjct status`, 'info');
+        if (event.ran > 0 && (ctx.hasUI || headless(ctx))) report(ctx, `prjct: ${event.ran} service(s) finished: ${event.ids.join(', ')}. /prjct status`, 'info');
       }
     };
     runner = new JobRunner({ path, services, onEvent });
@@ -90,13 +90,15 @@ export default function prjctExtension(pi: ExtensionAPI) {
     const sub = (args ?? '').trim();
     const [head = '', ...rest] = sub.split(/\s+/);
     const owner = runtime(ctx.cwd, ctx.sessionManager?.getSessionId() ?? attempt);
-    const usage = 'Usage: /prjct (or /p) | init | sync | status | run <service> | analyze | export <path> | work [title] | ship. init connects the project and queues the index, stack and history services; analyze runs the purpose and patterns services in a child Pi; export writes the briefs as one portable markdown file.';
+    const usage = 'Usage: /prjct | init | sync | status | run <service> | analyze | export <path> | work [title] | ship. init connects the project and queues the index, stack and history services; analyze runs the purpose and patterns services in a child Pi; export writes the briefs as one portable markdown file.';
     if (head === 'init' || head === 'sync') {
       const connected = head === 'init' ? await owner.connectProject(ctx.signal) : undefined;
       const runner = await runnerFor(owner, ctx);
       if (!runner) { report(ctx, 'No bound project. Run /prjct init first.', 'error'); return; }
       const queued = await owner.shareWalk(() => head === 'init' ? runner.enqueue([...MECHANICAL_SERVICES], 'init') : runner.enqueueStale('sync'));
-      const tail = queued.length ? `Queued: ${queued.join(', ')}. /prjct status follows progress.` : 'All services are current.';
+      // A re-run never re-creates: it refreshes only the services whose inputs changed.
+      const refreshing = head === 'sync' || connected?.alreadyBound;
+      const tail = queued.length ? `${refreshing ? 'Refreshing out-of-date services' : 'Queued'}: ${queued.join(', ')}. /prjct status follows progress.` : 'All services are current.';
       const initialization = connected ? `${connected.alreadyBound ? 'Project already initialized.' : 'Project initialized.'} ${connected.text} ` : '';
       report(ctx, `${initialization}${tail}`, 'info');
       runner.start();
@@ -157,7 +159,7 @@ export default function prjctExtension(pi: ExtensionAPI) {
     if (!sub) report(ctx, await owner.statusText(), 'info');
     else report(ctx, usage, 'error');
   };
-  for (const name of ['prjct', 'p'] as const) pi.registerCommand(name, {
+  pi.registerCommand('prjct', {
     description: 'init (connect + background index/stack/history) | sync | status | run <service> | analyze (purpose + patterns in a child Pi) | export <path> | work [title] | ship.',
     handler: commandHandler,
   });

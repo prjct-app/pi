@@ -44,7 +44,7 @@ test('jobs run in dependency order, persist their outcome, and stale-only enqueu
     assert.equal(typeof file.jobs.index?.durationMs, 'number');
     assert.equal(file.jobs.history, undefined);
     assert.equal(events.filter(event => event.type === 'progress').length, 6);
-    assert.deepEqual(events.at(-1), { type: 'idle', ran: 2 });
+    assert.deepEqual(events.at(-1), { type: 'idle', ran: 2, ids: ['index', 'stack'] });
     assert.match(formatJobs(file as never, ['index', 'stack', 'history']).join('\n'), /index\s+done/);
     // Forcing re-queues a current service; a plain enqueue of a done one is a no-op until it is stale.
     assert.deepEqual(await runner.enqueue(['history'], 'run', { force: true }), ['history']);

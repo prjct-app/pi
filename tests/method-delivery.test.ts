@@ -146,7 +146,7 @@ test('a Pi session without any skills retrieves and follows method guidance thro
   assert.match(JSON.stringify(final), /failing test first/i);
 });
 
-test('/p is an alias: p init initializes, p status reports, without double registration', { timeout: 30_000 }, async t => {
+test('/prjct init initializes through a real Pi session; /p is not a registered command', { timeout: 30_000 }, async t => {
   const { fauxProvider, InMemoryCredentialStore, InMemoryModelsStore } = await import('@earendil-works/pi-ai');
   const { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } = await import('@earendil-works/pi-coding-agent');
   const extension = (await import('../src/extension.ts')).default;
@@ -169,10 +169,10 @@ test('/p is an alias: p init initializes, p status reports, without double regis
     model: faux.getModel(), sessionManager: SessionManager.inMemory(cwd), tools: ['prjct_context'] });
   t.after(async () => session.dispose());
   faux.setResponses([]);
-  await session.prompt('/p init');
+  await session.prompt('/prjct init');
   await session.agent.waitForIdle();
-  // init queued synthesis; no scripted model response needed for the alias check.
+  // init queued synthesis; no scripted model response needed for the command check.
   const identity = await readRecord(join(home, 'identity/index.json'));
-  assert.ok(identity, '/p init must create the store');
+  assert.ok(identity, '/prjct init must create the store');
   assert.match(JSON.stringify(identity!.payload), /p_[a-f0-9]{12}/);
 });

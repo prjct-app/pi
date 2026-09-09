@@ -68,10 +68,16 @@ test('headless commands keep the user informed: every command and job lifecycle 
   assert.match(errText(), /Project initialized\. Connected project p_[0-9a-f]+ .*Queued: index, stack, history\./);
   assert.match(errText(), /prjct index…/);
   assert.match(errText(), /prjct index done \([\d.]+s\):/);
-  assert.match(errText(), /prjct: 3 service\(s\) finished\. \/prjct status/);
+  assert.match(errText(), /prjct: 3 service\(s\) finished: index, stack, history\. \/prjct status/);
 
   await run('status');
   assert.match(errLines.at(-1) ?? '', /index\s+done/);
+
+  // Re-init after an edit refreshes only what changed; it never re-creates.
+  await writeFile(join(cwd, 'NOTES.md'), '# Notes\n');
+  await run('init');
+  assert.match(errText(), /Project already initialized\. Reconnected project p_[0-9a-f]+ .*Refreshing out-of-date services: index, stack\. \/prjct status follows progress\./);
+  assert.match(errText(), /prjct: 2 service\(s\) finished: index, stack\. \/prjct status/);
 
   // A failing service is reported where the user can see it, not only appended.
   process.env.FAKE_PI_MODE = 'fail';
@@ -110,9 +116,10 @@ test('/prjct init connects and runs services without prompting the model; status
 
   const host = stubHost();
   prjctExtension(host.pi);
+  assert.deepEqual([...host.commands.keys()], ['prjct'], 'only /prjct is registered; the /p alias is gone');
   const notices: string[] = [];
   const ctx = stubCtx(cwd, notices);
-  const run = (args: string) => host.commands.get('p')!(args, ctx);
+  const run = (args: string) => host.commands.get('prjct')!(args, ctx);
 
   await run('status');
   assert.match(notices.at(-1) ?? '', /No bound project/);
