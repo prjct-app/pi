@@ -16,12 +16,14 @@ export type ContextRequest = Type.Static<typeof ContextParameters>;
 export const ContextLookupResponseSchema = Type.Object({
   status: Type.String({ enum: ['ok', 'partial', 'abstained'] }),
   items: Type.Array(Type.Object({
-    kind: Type.String({ enum: ['purpose', 'stack', 'architecture', 'design', 'work', 'method'] }),
+    kind: Type.String({ enum: ['purpose', 'stack', 'architecture', 'design', 'work', 'method', 'history'] }),
     summary: Type.String({ minLength: 1, maxLength: 4096 }),
     standing: Type.String({ enum: ['candidate', 'supported', 'needs_review', 'contradicted', 'superseded'] }),
     sources: Type.Array(ContentReferenceSchema, { minItems: 1, maxItems: 16 }),
   }, { additionalProperties: false }), { maxItems: 32 }),
   gaps: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 32 }),
+  /** Current process-state revision, so a follow-up mutation can name expectedRevision without another discover. */
+  stateRevision: Type.Optional(Type.Integer({ minimum: 0 })),
 }, { additionalProperties: false });
 
 const responseValidator = Schema.Compile(ContextLookupResponseSchema);

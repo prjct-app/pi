@@ -1,4 +1,4 @@
-import { readdir, readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
 export type ProjectProfile = Readonly<{
@@ -23,27 +23,34 @@ export type ProjectProfile = Readonly<{
   }>;
 }>;
 
-const readJson = async (path: string): Promise<Record<string, unknown> | undefined> => {
-  try {
-    return JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-  } catch {
-    return undefined;
-  }
-};
+type ProfileSource = Readonly<{ relativePath: string; content?: string }>;
 
-const exists = async (root: string, name: string): Promise<boolean> => {
-  try {
-    await readFile(join(root, name));
-    return true;
-  } catch {
-    return false;
-  }
+// Contents come from the collected sources when present; disk is the fallback
+// for callers that only know paths (and for manifests outside the index rules).
+const makeReaders = (root: string, files: readonly ProfileSource[]) => {
+  const byPath = new Map(files.map(file => [file.relativePath, file]));
+  const readText = async (name: string): Promise<string | undefined> => {
+    const known = byPath.get(name);
+    if (known?.content !== undefined) return known.content;
+    return readFile(join(root, name), 'utf8').catch(() => undefined);
+  };
+  const exists = async (name: string): Promise<boolean> => {
+    if (byPath.has(name)) return true;
+    return stat(join(root, name)).then(info => info.isFile(), () => false);
+  };
+  const readJson = async (name: string): Promise<Record<string, unknown> | undefined> => {
+    const text = await readText(name);
+    if (text === undefined) return undefined;
+    try { return JSON.parse(text) as Record<string, unknown>; } catch { return undefined; }
+  };
+  return { readText, exists, readJson };
 };
 
 // Mechanical profile only: manifests, scripts, file census. It names what the
 // repo declares; purpose, patterns and architecture remain agent-synthesized
 // claims with evidence, never conclusions drawn from file counts alone.
-export const detectProfile = async (root: string, files: readonly { relativePath: string }[]): Promise<ProjectProfile> => {
+export const detectProfile = async (root: string, files: readonly ProfileSource[]): Promise<ProjectProfile> => {
+  const { readText, exists, readJson } = makeReaders(root, files);
   const languages: Record<string, number> = Object.create(null);
   for (const file of files) {
     const match = file.relativePath.match(/\.([a-z0-9]+)$/i);
@@ -58,7 +65,7 @@ export const detectProfile = async (root: string, files: readonly { relativePath
   const scripts: Record<string, string> = {};
   let ecosystem = 'unknown';
 
-  const pkg = await readJson(join(root, 'package.json'));
+  const pkg = await readJson('package.json');
   if (pkg) {
     manifests.push('package.json');
     ecosystem = 'node';
@@ -78,22 +85,24 @@ export const detectProfile = async (root: string, files: readonly { relativePath
       if (pkgScripts[name]) scripts[name] = pkgScripts[name]!;
     }
   }
-  if (await exists(root, 'tsconfig.json')) { manifests.push('tsconfig.json'); tools.add('typescript'); }
-  if (await exists(root, 'Cargo.toml')) { manifests.push('Cargo.toml'); ecosystem = ecosystem === 'unknown' ? 'rust' : ecosystem; }
-  if (await exists(root, 'go.mod')) { manifests.push('go.mod'); ecosystem = ecosystem === 'unknown' ? 'go' : ecosystem; }
-  if (await exists(root, 'pyproject.toml') || await exists(root, 'requirements.txt')) {
-    if (await exists(root, 'pyproject.toml')) manifests.push('pyproject.toml');
-    if (await exists(root, 'requirements.txt')) manifests.push('requirements.txt');
+  if (await exists('tsconfig.json')) { manifests.push('tsconfig.json'); tools.add('typescript'); }
+  const [hasCargo = false, hasGo = false, hasPyproject = false, hasRequirements = false, hasSwift = false, hasGemfile = false, hasContextMap = false] = await Promise.all(
+    ['Cargo.toml', 'go.mod', 'pyproject.toml', 'requirements.txt', 'Package.swift', 'Gemfile', 'CONTEXT-MAP.md'].map(exists));
+  if (hasCargo) { manifests.push('Cargo.toml'); ecosystem = ecosystem === 'unknown' ? 'rust' : ecosystem; }
+  if (hasGo) { manifests.push('go.mod'); ecosystem = ecosystem === 'unknown' ? 'go' : ecosystem; }
+  if (hasPyproject || hasRequirements) {
+    if (hasPyproject) manifests.push('pyproject.toml');
+    if (hasRequirements) manifests.push('requirements.txt');
     ecosystem = ecosystem === 'unknown' ? 'python' : ecosystem;
-    if (await exists(root, 'pyproject.toml')) {
-      const text = await readFile(join(root, 'pyproject.toml'), 'utf8').catch(() => '');
+    if (hasPyproject) {
+      const text = (await readText('pyproject.toml')) ?? '';
       if (text.includes('fastapi')) frameworks.add('fastapi');
       if (text.includes('django')) frameworks.add('django');
       if (text.includes('pytest')) tools.add('pytest');
     }
   }
-  if (await exists(root, 'Package.swift')) { manifests.push('Package.swift'); ecosystem = ecosystem === 'unknown' ? 'swift' : ecosystem; }
-  if (await exists(root, 'Gemfile')) { manifests.push('Gemfile'); ecosystem = ecosystem === 'unknown' ? 'ruby' : ecosystem; }
+  if (hasSwift) { manifests.push('Package.swift'); ecosystem = ecosystem === 'unknown' ? 'swift' : ecosystem; }
+  if (hasGemfile) { manifests.push('Gemfile'); ecosystem = ecosystem === 'unknown' ? 'ruby' : ecosystem; }
 
   const hasTests = files.some(file => /(^|\/)(tests?|__tests__|spec)\//.test(file.relativePath) || /\.(test|spec)\.[a-z]+$/.test(file.relativePath));
 
@@ -107,7 +116,7 @@ export const detectProfile = async (root: string, files: readonly { relativePath
   const readHeadings = async (name: string): Promise<boolean> => {
     const file = markdown.find(item => item.relativePath.toLowerCase() === name.toLowerCase());
     if (!file) return false;
-    const text = await readFile(join(root, file.relativePath), 'utf8').catch(() => '');
+    const text = (await readText(file.relativePath)) ?? '';
     const found = text.split('\n').map(line => line.trim()).filter(line => /^#{1,2}\s/.test(line)).map(line => line.replace(/^#{1,2}\s+/, ''));
     if (!title && found[0]) title = found[0];
     headings.push(...found.slice(0, 6));
@@ -115,7 +124,7 @@ export const detectProfile = async (root: string, files: readonly { relativePath
   };
   const readme = await readHeadings('README.md');
   const context = await readHeadings('CONTEXT.md');
-  const contextMap = await exists(root, 'CONTEXT-MAP.md');
+  const contextMap = hasContextMap;
   const agents = await readHeadings('AGENTS.md');
   const docs = { ...(title ? { title } : {}), readme, context, contextMap, agents, adrCount, docFiles, headings: headings.slice(0, 12) };
   if (ecosystem === 'unknown' && markdown.length && (languages.md ?? 0) + (languages.mdx ?? 0) >= Math.max(1, files.length / 2)) {
@@ -139,10 +148,10 @@ export const detectProfile = async (root: string, files: readonly { relativePath
     else framework = testScript.split(' ')[0] ?? 'unknown';
   } else if (testFiles.some(file => file.relativePath.endsWith('.py'))) framework = 'pytest';
   else if (testFiles.some(file => /_test\.go$/.test(file.relativePath))) framework = 'go';
-  else if (await exists(root, 'Cargo.toml')) framework = 'cargo';
-  else if (await exists(root, 'Package.swift')) framework = 'swift';
+  else if (hasCargo) framework = 'cargo';
+  else if (hasSwift) framework = 'swift';
   else if (testFiles.length) {
-    const examples = await Promise.all(testFiles.slice(0, 8).map(file => readFile(join(root, file.relativePath), 'utf8').catch(() => '')));
+    const examples = await Promise.all(testFiles.slice(0, 8).map(file => readText(file.relativePath).then(text => text ?? '')));
     if (examples.some(text => /['"]node:test['"]/.test(text))) framework = 'node:test';
   }
   const pattern = testFiles.length

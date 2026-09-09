@@ -1,102 +1,157 @@
 import { homedir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import { fileURLToPath } from 'node:url';
+import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { ProcessRuntime, type HostExecution } from './pi/process-runtime.ts';
 import { createProcessTools, processToolNames } from './pi/register-tools.ts';
 import { newId } from './workspace/ids.ts';
 import { redactSecrets } from './knowledge/redact.ts';
+import { JobRunner, formatJobs, type RunnerEvent } from './jobs/runner.ts';
+import { MECHANICAL_SERVICES, MODEL_SERVICES, SERVICE_ORDER, createServices } from './jobs/services.ts';
 
 const agentHome = (): string => process.env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi', 'agent');
+// This file is the extension entry; child Pi processes load it explicitly.
+const extensionPath = fileURLToPath(import.meta.url);
+// Inside a child job the extension must not schedule further jobs.
+const isChildJob = (): boolean => Boolean(process.env.PRJCT_JOB);
 
 // Registers process tools and /prjct. Does not inject context or create a store at
 // load. Durable process state lives in the global prjct home, never the client checkout.
 export default function prjctExtension(pi: ExtensionAPI) {
   let attempt = newId('attempt');
   const runtimes = new Map<string, ProcessRuntime>();
+  const runners = new Map<string, JobRunner>();
   const runtime = (cwd: string, sessionId = attempt) => {
     const key = `${sessionId}:${cwd}`;
     let owner = runtimes.get(key);
     if (!owner) { owner = new ProcessRuntime({ agentHome: agentHome(), cwd, attemptId: attempt, sessionId }); runtimes.set(key, owner); }
     return owner;
   };
-  let synthesisQueued = false;
-  let settleSynthesis: (() => void) | undefined;
   const executions = new Map<string, { owner: ProcessRuntime; captured: HostExecution }>();
   const activate = (names: string[]) => {
     pi.setActiveTools([...new Set([...pi.getActiveTools(), ...names])]);
   };
   for (const tool of createProcessTools(agentHome, activate, () => attempt, runtime)) pi.registerTool(tool);
 
+  // One runner per bound project (keyed by its queue file). UI feedback goes
+  // through the context that started it; nothing enters the model's context.
+  const runnerFor = async (owner: ProcessRuntime, ctx: Pick<ExtensionContext, 'hasUI' | 'ui' | 'model'>): Promise<JobRunner | undefined> => {
+    const path = await owner.jobsPath();
+    if (!path) return undefined;
+    let runner = runners.get(path);
+    if (runner) return runner;
+    // Model services always use the session's model (provider/id), thinking low.
+    const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+    const services = createServices(owner, { extensionPath, ...(model ? { model } : {}) });
+    const status = (text: string | undefined) => { if (ctx.hasUI) ctx.ui.setStatus('prjct', text); };
+    let lastProgress = 0;
+    const onEvent = (event: RunnerEvent) => {
+      if (event.type === 'started') status(`prjct ${event.id}…`);
+      else if (event.type === 'progress') {
+        const nowMs = Date.now();
+        if (nowMs - lastProgress > 200) { lastProgress = nowMs; status(`prjct ${event.id} ${event.done}/${event.total}`); }
+      } else if (event.type === 'finished') {
+        pi.appendEntry('prjct_job', { id: event.id, status: 'done', summary: event.summary, durationMs: event.durationMs });
+        // A model brief is new knowledge the agent may want: one line, next turn, no interruption.
+        if ((MODEL_SERVICES as readonly string[]).includes(event.id)) {
+          void pi.sendMessage({ customType: 'prjct', content: `prjct: the ${event.id} brief is ready; prjct_context lookup "${event.id}" serves it.`, display: true }, { deliverAs: 'nextTurn' });
+        }
+      } else if (event.type === 'failed') {
+        pi.appendEntry('prjct_job', { id: event.id, status: 'failed', error: event.error });
+        if (ctx.hasUI) ctx.ui.notify(`prjct ${event.id} failed: ${event.error}`, 'warning');
+      } else if (event.type === 'idle') {
+        status(undefined);
+        if (event.ran > 0 && ctx.hasUI) ctx.ui.notify(`prjct: ${event.ran} service(s) finished. /prjct status`, 'info');
+      }
+    };
+    runner = new JobRunner({ path, services, onEvent });
+    runners.set(path, runner);
+    return runner;
+  };
+  const stopRunners = async () => {
+    await Promise.allSettled([...runners.values()].map(runner => runner.stop()));
+    runners.clear();
+  };
+
   const commandHandler = async (args: string, ctx: Parameters<Parameters<typeof pi.registerCommand>[1]['handler']>[1]) => {
-      const sub = (args ?? '').trim();
-      const head = sub.split(/\s+/)[0] ?? '';
-      const runIndexAndSynthesize = async (run: (owner: ProcessRuntime, signal?: AbortSignal) => Promise<{ text: string; rebuilt: boolean }>) => {
-        const owner = runtime(ctx.cwd, ctx.sessionManager?.getSessionId() ?? attempt);
-        const startedAttempt = attempt;
-        const result = await run(owner, ctx.signal);
-        if (attempt !== startedAttempt || ctx.signal?.aborted) return;
-        ctx.ui.notify(result.text, 'info');
-        const pending = result.rebuilt || await owner.understandingPending();
-        if (attempt !== startedAttempt || ctx.signal?.aborted) return;
-        if (pending && !synthesisQueued) {
-          synthesisQueued = true;
-          const settled = ctx.hasUI ? undefined : new Promise<void>(resolve => { settleSynthesis = resolve; });
-          // Pi is the motor: prjct collected mechanical facts; the session's model
-          // generates the understanding and records it as evidenced claims.
-          pi.sendUserMessage(
-            'prjct needs project understanding. ONE pass, no repeated discovery: ' +
-            '1) prjct_context discover (query: "knowledge search") once — it returns projectId and stateRevision. ' +
-            '2) prjct_context lookup once for the mechanical profile and existing claims. ' +
-            '3) read the 3-6 key files natively (README/CONTEXT/main entry points); each read becomes an obs_ observation visible in a later lookup. ' +
-            '4) prjct_knowledge propose each claim (purpose, architecture, conventions) with supports = src_ ids from search or reads — propose needs no expectedRevision. ' +
-            '5) one more prjct_context lookup (query by a file you read) to get obs_ ids, then prjct_knowledge resolve/confirm each claim with evidenceIds = those obs_ ids and expectedRevision = the stateRevision from each mutation result you just received (every committed mutation returns stateRevision — use it, do not re-discover). ' +
-            'Do not write generic framework advice; every claim needs evidence from this checkout. Cover purpose, architecture, conventions and examples; report missing coverage explicitly in gaps.',
-            { deliverAs: 'followUp' },
-          );
-          // Print/RPC must not dispose the session while Pi is still running the
-          // queued synthesis. Delegate settlement to Pi, never run our own loop.
-          if (settled) {
-            // waitForIdle may still report idle before sendUserMessage starts its
-            // asynchronous prompt. The native settlement event covers that gap.
-            const abort = () => settleSynthesis?.();
-            ctx.signal?.addEventListener('abort', abort, { once: true });
-            try { await settled; } finally { ctx.signal?.removeEventListener('abort', abort); }
-          }
-        }
-      };
-      if (head === 'init') {
-        await runIndexAndSynthesize((owner, signal) => owner.initProject(signal));
-        return;
-      }
-      if (head === 'sync') {
-        await runIndexAndSynthesize((owner, signal) => owner.syncProject(signal));
-        return;
-      }
-      if (head === 'work') {
-        const title = sub.slice('work'.length).trim();
-        if (title) {
-          ctx.ui.notify(await runtime(ctx.cwd, ctx.sessionManager?.getSessionId() ?? attempt).createWork(title), 'info');
-        } else {
-          ctx.ui.notify(await runtime(ctx.cwd, ctx.sessionManager?.getSessionId() ?? attempt).listWorksText(), 'info');
-        }
-        return;
-      }
-      if (head === 'ship') {
-        ctx.ui.notify(await runtime(ctx.cwd, ctx.sessionManager?.getSessionId() ?? attempt).ship(), 'info');
-        return;
-      }
-      if (!sub) ctx.ui.notify(await runtime(ctx.cwd, ctx.sessionManager?.getSessionId() ?? attempt).statusText(), 'info');
-      else ctx.ui.notify('Usage: /prjct (or /p) | init | sync | work [title] | ship. init creates the store and runs the first index+analysis; sync/work/ship require it.', 'error');
+    const sub = (args ?? '').trim();
+    const [head = '', ...rest] = sub.split(/\s+/);
+    const owner = runtime(ctx.cwd, ctx.sessionManager?.getSessionId() ?? attempt);
+    const usage = 'Usage: /prjct (or /p) | init | sync | status | run <service> | analyze | export <path> | work [title] | ship. init connects the project and queues the index, stack and history services; analyze runs the purpose and patterns services in a child Pi; export writes the briefs as one portable markdown file.';
+    if (head === 'init' || head === 'sync') {
+      const connected = head === 'init' ? await owner.connectProject(ctx.signal) : undefined;
+      const runner = await runnerFor(owner, ctx);
+      if (!runner) { ctx.ui.notify('No bound project. Run /prjct init first.', 'error'); return; }
+      const queued = head === 'init' ? await runner.enqueue([...MECHANICAL_SERVICES], 'init') : await runner.enqueueStale('sync');
+      const tail = queued.length ? `Queued: ${queued.join(', ')}. /prjct status follows progress.` : 'All services are current.';
+      ctx.ui.notify(`${connected ? `${connected.text} ` : ''}${tail}`, 'info');
+      runner.start();
+      // Headless hosts (print/JSON) have no later turn to observe progress: finish here.
+      if (!ctx.hasUI) await runner.idle();
+      return;
+    }
+    if (head === 'status') {
+      const runner = await runnerFor(owner, ctx);
+      if (!runner) { ctx.ui.notify('No bound project. Run /prjct init first.', 'error'); return; }
+      const lines = [await owner.statusText(), 'Services:', ...formatJobs(await runner.read(), SERVICE_ORDER), await owner.understandingText()];
+      ctx.ui.notify(lines.join('\n'), 'info');
+      return;
+    }
+    if (head === 'run') {
+      const id = rest[0] ?? '';
+      if (!(SERVICE_ORDER as readonly string[]).includes(id)) { ctx.ui.notify(`Unknown service "${id}". Services: ${SERVICE_ORDER.join(', ')}.`, 'error'); return; }
+      const runner = await runnerFor(owner, ctx);
+      if (!runner) { ctx.ui.notify('No bound project. Run /prjct init first.', 'error'); return; }
+      const queued = await runner.enqueue([id], 'run', { force: true });
+      ctx.ui.notify(queued.length ? `Queued: ${queued.join(', ')}.` : `${id} is already queued or running.`, 'info');
+      runner.start();
+      if (!ctx.hasUI) await runner.idle();
+      return;
+    }
+    if (head === 'analyze') {
+      const runner = await runnerFor(owner, ctx);
+      if (!runner) { ctx.ui.notify('No bound project. Run /prjct init first.', 'error'); return; }
+      const queued = await runner.enqueue([...MODEL_SERVICES], 'analyze', { force: true });
+      ctx.ui.notify(queued.length ? `Queued: ${queued.join(', ')} (child Pi, ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : 'default model'}, thinking low). /prjct status follows progress.` : 'Analysis services are already queued or running.', 'info');
+      runner.start();
+      if (!ctx.hasUI) await runner.idle();
+      return;
+    }
+    if (head === 'export') {
+      const target = rest[0];
+      if (!target) { ctx.ui.notify('Usage: /prjct export <path> [--force]. Writes the purpose, stack, patterns and history briefs as one markdown file (for AGENTS.md-style consumers).', 'error'); return; }
+      const exported = await owner.exportBriefs();
+      if (!exported) { ctx.ui.notify('No bound project. Run /prjct init first.', 'error'); return; }
+      if (!exported.included.length) { ctx.ui.notify('Nothing to export yet: run /prjct init (stack, history) and /prjct analyze (purpose, patterns) first.', 'error'); return; }
+      const destination = resolve(ctx.cwd, target);
+      const { writeFile, stat } = await import('node:fs/promises');
+      const exists = await stat(destination).then(() => true, () => false);
+      if (exists && !rest.includes('--force')) { ctx.ui.notify(`${destination} exists; add --force to overwrite.`, 'error'); return; }
+      await writeFile(destination, exported.text, 'utf8');
+      ctx.ui.notify(`Exported ${exported.included.join(', ')} to ${destination} (${Buffer.byteLength(exported.text, 'utf8')} bytes).`, 'info');
+      return;
+    }
+    if (head === 'work') {
+      const title = sub.slice('work'.length).trim();
+      ctx.ui.notify(title ? await owner.createWork(title) : await owner.listWorksText(), 'info');
+      return;
+    }
+    if (head === 'ship') {
+      ctx.ui.notify(await owner.ship(), 'info');
+      return;
+    }
+    if (!sub) ctx.ui.notify(await owner.statusText(), 'info');
+    else ctx.ui.notify(usage, 'error');
   };
   for (const name of ['prjct', 'p'] as const) pi.registerCommand(name, {
-    description: 'init (first index + analysis) | sync | work [title] | ship. The agent drives the rest through tools.',
+    description: 'init (connect + background index/stack/history) | sync | status | run <service> | analyze (purpose + patterns in a child Pi) | export <path> | work [title] | ship.',
     handler: commandHandler,
   });
 
-  pi.on('session_start', async () => {
+  pi.on('session_start', async (_event, ctx) => {
+    await stopRunners();
     attempt = newId('attempt');
-    settleSynthesis?.(); settleSynthesis = undefined;
-    runtimes.clear(); executions.clear(); synthesisQueued = false;
+    runtimes.clear(); executions.clear();
     const active = pi.getActiveTools();
     const prjctActive = active.filter(name => processToolNames.includes(name));
     const others = active.filter(name => !processToolNames.includes(name));
@@ -104,9 +159,18 @@ export default function prjctExtension(pi: ExtensionAPI) {
     const next = allOn ? [...others, 'prjct_context'] : [...others, ...prjctActive];
     if (!next.includes('prjct_context')) next.push('prjct_context');
     pi.setActiveTools(next);
+    // Resume work a previous session left queued or interrupted; never start new work here.
+    if (isChildJob()) return;
+    try {
+      const owner = runtime(ctx.cwd, ctx.sessionManager?.getSessionId() ?? attempt);
+      const runner = await runnerFor(owner, ctx);
+      if (!runner) return;
+      await runner.resume();
+      const file = await runner.read();
+      if (Object.values(file.jobs).some(row => row.status === 'queued')) runner.start();
+    } catch { /* Unbound or unreadable project: nothing to resume. */ }
   });
 
-  pi.on('agent_settled', () => { synthesisQueued = false; settleSynthesis?.(); settleSynthesis = undefined; });
   // Real user input is native evidence for human-in-the-loop methods (grilling
   // decisions, takeover consent). Commands and extension-injected messages are not.
   pi.on('input', async (event, ctx) => {
@@ -121,7 +185,11 @@ export default function prjctExtension(pi: ExtensionAPI) {
     } catch { /* Uninitialized projects do not record. */ }
     return { action: 'continue' as const };
   });
-  pi.on('session_shutdown', () => { settleSynthesis?.(); settleSynthesis = undefined; runtimes.clear(); executions.clear(); });
+  pi.on('session_shutdown', async () => {
+    await stopRunners();
+    await Promise.allSettled([...runtimes.values()].map(owner => owner.flush()));
+    runtimes.clear(); executions.clear();
+  });
   // Capture native input and the pre-execution source snapshot. Pi still owns all execution.
   pi.on('tool_execution_start', async (event, ctx) => {
     if (!['bash', 'read'].includes(event.toolName)) return;

@@ -167,6 +167,31 @@ test('native source reads can complete documentation tasks, but cannot bypass un
   await assert.rejects(async()=>f.runtime.execute('prjct_task',{action:'transition',workId,taskId,transition:'complete',assessmentId,...await f.mutation()}),{code:'INCOMPLETE_METHOD'});
 });
 
+test('evidence stays honest under the source cache: edits during a call demote it, read paths hash the current bytes',async t=>{
+  const f=await setup(t);await f.runtime.createWork('Freshness');
+  const {sha256}=await import('../src/workspace/ids.ts');
+  // A source edited while the "tool" ran: the before hash no longer matches.
+  const beforeHash=await f.runtime.sourceSnapshot();
+  await writeFile(join(f.cwd,'README.md'),'# Scheduling\nWaybill means signed proof of delivery.\nEdited during the call.\n');
+  await f.runtime.recordObservation('bash completed: touched README',{toolCallId:'edit_race',toolName:'bash',command:'true',outcome:'succeeded',beforeHash});
+  type Obs={provenance:string;execution?:{outcome:string};supports:Array<{id:string;contentHash:string}>};
+  const raced=((await f.record())!.payload as {observations:Obs[]}).observations.at(-1)!;
+  assert.equal(raced.provenance,'native_observation');assert.equal(raced.execution?.outcome,'unknown');
+  // A native read right after an edit carries the hash of the bytes it read, not a stale cache entry.
+  const beforeRead=await f.runtime.sourceSnapshot();
+  await writeFile(join(f.cwd,'README.md'),'# Scheduling\nFinal text.\n');
+  await f.runtime.recordObservation('read README',{toolCallId:'read_after_edit',toolName:'read',outcome:'succeeded',sourcePaths:['README.md'],beforeHash:beforeRead});
+  const read=((await f.record())!.payload as {observations:Obs[]}).observations.at(-1)!;
+  assert.equal(read.supports[0]?.id,`src_${sha256('README.md').slice(0,12)}`);
+  assert.equal(read.supports[0]?.contentHash,sha256('# Scheduling\nFinal text.\n'));
+  assert.equal(read.execution?.outcome,'unknown');
+  // Unchanged sources across the call keep native provenance.
+  const stable=await f.runtime.sourceSnapshot();
+  await f.runtime.recordObservation('bash completed: ls',{toolCallId:'stable_call',toolName:'bash',command:'ls',outcome:'succeeded',beforeHash:stable});
+  const kept=((await f.record())!.payload as {observations:Obs[]}).observations.at(-1)!;
+  assert.equal(kept.provenance,'native_observation');assert.equal(kept.execution?.outcome,'succeeded');
+});
+
 test('identity lookup remains safe when cwd contains the runtime home',async t=>{
   const root=await mkdtemp(join(tmpdir(),'prjct-store-under-cwd-'));t.after(()=>rm(root,{recursive:true,force:true}));
   const agentHome=join(root,'agent');await mkdir(agentHome);const cwd=root;const prjctHome=join(root,'private-store');
