@@ -179,3 +179,21 @@ test('persisted stat cache is reused across processes and ignored for another ch
     await rm(store, { recursive: true, force: true });
   }
 });
+
+test('maxAgeMs reuses a recent walk for informational readers while fresh always walks again', async () => {
+  const root = await fixture();
+  try {
+    const cache = new SourceCache(root);
+    const first = await cache.snapshot({ fresh: true });
+    await writeFile(join(root, 'src/a.ts'), 'export const a = 9;\n');
+    const tolerant = await cache.snapshot({ maxAgeMs: 5000 });
+    assert.equal(tolerant.generation, first.generation, 'a walk younger than the tolerance is reused');
+    const fresh = await cache.snapshot({ fresh: true });
+    assert.equal(fresh.generation, first.generation + 1);
+    assert.notEqual(fresh.hashes['src/a.ts'], first.hashes['src/a.ts']);
+    const expired = await cache.snapshot({ maxAgeMs: 0 });
+    assert.equal(expired.generation, fresh.generation + 1, 'a zero tolerance walks again');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

@@ -54,8 +54,16 @@ test('init connects without indexing; services then produce the index, stack and
   assert.match(history?.text ?? '', /1 commits/);
   assert.match(history?.text ?? '', /No tags/);
 
-  // Everything is current now; a second pass queues nothing.
-  assert.deepEqual(await runner.enqueueStale('sync'), []);
+  // Everything is current now; a second pass queues nothing, and the batch of checks costs one walk.
+  const { SourceCache } = await import('../src/representation/source-cache.ts');
+  let walks = 0; const originalWalk = (SourceCache.prototype as unknown as { walk: () => unknown }).walk;
+  (SourceCache.prototype as unknown as { walk: () => unknown }).walk = function (this: unknown) { walks += 1; return originalWalk.call(this); };
+  try {
+    assert.deepEqual(await runtime.shareWalk(() => runner.enqueueStale('sync')), []);
+    assert.equal(walks, 1, 'stale checks inside shareWalk reuse one walk');
+    assert.deepEqual(await runner.enqueueStale('sync'), []);
+    assert.equal(walks, 3, 'outside shareWalk every check walks');
+  } finally { (SourceCache.prototype as unknown as { walk: () => unknown }).walk = originalWalk; }
   assert.equal(await runtime.stackStale(), false);
   assert.equal(await runtime.historyStale(), false);
 

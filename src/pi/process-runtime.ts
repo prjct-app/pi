@@ -21,7 +21,7 @@ import {
   type BuildOptions, type CollectedSources, type ProjectIndex,
 } from '../representation/sync.ts';
 import { readdir, rm } from 'node:fs/promises';
-import { SourceCache } from '../representation/source-cache.ts';
+import { SourceCache, type SourceSnapshot } from '../representation/source-cache.ts';
 import { collectHistory, gitHead, renderHistory, type ProjectHistory } from '../jobs/history.ts';
 import { renderStack } from '../jobs/stack.ts';
 import { assertMethodProgress, METHOD_STAGES } from '../work/method-progress.ts';
@@ -112,6 +112,7 @@ export class ProcessRuntime {
   private sourceCache: SourceCache | undefined;
   private identityPromise: Promise<IdentityResolution> | undefined;
   private currentCache: { generation: number; current: CurrentSources } | undefined;
+  private walkShare = new AsyncLocalStorage<{ snapshot?: Promise<SourceSnapshot> }>();
   private indexCache: { manifestHash: string; index: ProjectIndex } | undefined;
   private transaction = new AsyncLocalStorage<{ params: Record<string, unknown>; hash: string; pending?: Document; baseRevision?: number; files?: Array<{ path: string; content: string; overwrite?: boolean }>; confirm?: (message: string) => Promise<boolean> }>();
   constructor(options: ProcessRuntimeOptions) {
@@ -136,7 +137,8 @@ export class ProcessRuntime {
   async execute(name: string, params: Record<string, unknown>, extras: { signal?: AbortSignal; activate?: (names: string[]) => void; confirm?: (message: string) => Promise<boolean> } = {}): Promise<ToolResult> {
     const bound = await this.peekBinding();
     const path = bound ? this.statePath(this.keyOf(bound)) : this.locatorPath();
-    return withFileMutationQueue(path, () => this.executeQueued(name, params, extras));
+    // One tool call is one host operation: every source check inside it sees the same walk.
+    return withFileMutationQueue(path, () => this.shareWalk(() => this.executeQueued(name, params, extras)));
   }
 
   private async executeQueued(name: string, params: Record<string, unknown>, extras: { signal?: AbortSignal; activate?: (names: string[]) => void; confirm?: (message: string) => Promise<boolean> } = {}): Promise<ToolResult> {
@@ -311,7 +313,7 @@ export class ProcessRuntime {
     if (!bound) return true;
     const stored = await this.loadManifest(this.keyOf(bound));
     if (!stored || stored.configRevision !== INDEX_CONFIG_REVISION) return true;
-    const snapshot = await (await this.sources()).snapshot({ fresh: true });
+    const snapshot = await this.freshSnapshot();
     return stored.manifestHash !== snapshot.manifestHash;
   }
 
@@ -412,7 +414,7 @@ export class ProcessRuntime {
     if (!bound) return true;
     const doc = await this.readContextDoc('stack');
     if (!doc) return true;
-    const snapshot = await (await this.sources()).snapshot({ fresh: true });
+    const snapshot = await this.freshSnapshot();
     return doc.freshness.manifestHash !== snapshot.manifestHash;
   }
 
@@ -466,7 +468,7 @@ export class ProcessRuntime {
   private async briefStale(id: string): Promise<boolean> {
     const doc = await this.readContextDoc(id);
     if (!doc) return true;
-    const snapshot = await (await this.sources()).snapshot({ fresh: true });
+    const snapshot = await this.freshSnapshot();
     return Boolean(doc.freshness.manifestHash) && doc.freshness.manifestHash !== snapshot.manifestHash;
   }
 
@@ -575,10 +577,20 @@ export class ProcessRuntime {
     return { manifestHash, hashes, byId };
   }
 
-  // Every reader sees a walk that starts now: evidence about "did sources
-  // change during this call" must never come from an older walk.
+  // Every reader sees a walk that starts now: "did sources change during this
+  // call" must never come from an older walk. Within one host operation
+  // (shareWalk) the first walk is reused so a batch of checks costs one walk.
+  private async freshSnapshot(): Promise<SourceSnapshot> {
+    const shared = this.walkShare.getStore();
+    if (shared) { shared.snapshot ??= (await this.sources()).snapshot({ fresh: true }); return shared.snapshot; }
+    return (await this.sources()).snapshot({ fresh: true });
+  }
+
+  /** Run `fn` with one shared stat walk for every source check it performs. */
+  shareWalk<T>(fn: () => Promise<T>): Promise<T> { return this.walkShare.run({}, fn); }
+
   private async currentSources(): Promise<CurrentSources> {
-    const snapshot = await (await this.sources()).snapshot({ fresh: true });
+    const snapshot = await this.freshSnapshot();
     if (this.currentCache?.generation === snapshot.generation) return this.currentCache.current;
     const current = this.currentOf(snapshot.hashes, snapshot.manifestHash);
     this.currentCache = { generation: snapshot.generation, current };
@@ -767,13 +779,14 @@ export class ProcessRuntime {
     const work = state.works.find(item => item.id === state.selectedWorkId);
     let projectItems: Array<{ kind: 'stack' | 'architecture' | 'purpose' | 'method' | 'history' | 'design'; summary: string; standing: 'supported' | 'needs_review'; sources: Ref[] }> = [];
     let projectGaps: string[] = [];
+    // One walk per lookup, shared by the project and work blocks.
+    const current = await this.currentSources();
     {
       // Project knowledge remains present alongside a work cycle: answer what the project IS. Mechanical profile plus
       // supported claims; purpose/patterns remain agent-synthesized claims.
       const index = await this.loadManifest(this.keyOf(bound));
       const items: Array<{ kind: 'stack' | 'architecture' | 'purpose' | 'method' | 'history' | 'design'; summary: string; standing: 'supported' | 'needs_review'; sources: Ref[] }> = [];
       const gaps: string[] = [];
-      const current = await this.currentSources();
       if (index && index.manifestHash !== current.manifestHash) gaps.push('Sources changed; review supported knowledge before applying it.');
       if (index) {
         const profile = index.profile;
@@ -852,7 +865,6 @@ export class ProcessRuntime {
     }
     const gaps: string[] = [...projectGaps];
     const index = await this.loadManifest(this.keyOf(bound));
-    const current = await this.currentSources();
     if (index?.profile.tests.command || (index && index.profile.tests.framework !== 'unknown')) {
       const tests = index.profile.tests;
       items.push({ kind: 'method' as const,

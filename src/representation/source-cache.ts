@@ -104,9 +104,11 @@ export class SourceCache {
    * so evidence about "what changed during this tool call" never reads a walk
    * that began before the call finished.
    */
-  async snapshot(options: { fresh?: boolean } = {}): Promise<SourceSnapshot> {
+  async snapshot(options: { fresh?: boolean; maxAgeMs?: number } = {}): Promise<SourceSnapshot> {
     if (!options.fresh) {
-      if (this.last && Date.now() - this.last.builtAt < this.ttlMs) return this.last.snapshot;
+      // Informational readers may name a tolerance; evidence readers never do.
+      const tolerance = options.maxAgeMs ?? this.ttlMs;
+      if (this.last && Date.now() - this.last.builtAt < tolerance) return this.last.snapshot;
       if (this.inFlight) return this.inFlight;
     } else if (this.inFlight) {
       await this.inFlight.catch(() => undefined);

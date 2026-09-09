@@ -82,7 +82,7 @@ export default function prjctExtension(pi: ExtensionAPI) {
       const connected = head === 'init' ? await owner.connectProject(ctx.signal) : undefined;
       const runner = await runnerFor(owner, ctx);
       if (!runner) { ctx.ui.notify('No bound project. Run /prjct init first.', 'error'); return; }
-      const queued = head === 'init' ? await runner.enqueue([...MECHANICAL_SERVICES], 'init') : await runner.enqueueStale('sync');
+      const queued = await owner.shareWalk(() => head === 'init' ? runner.enqueue([...MECHANICAL_SERVICES], 'init') : runner.enqueueStale('sync'));
       const tail = queued.length ? `Queued: ${queued.join(', ')}. /prjct status follows progress.` : 'All services are current.';
       ctx.ui.notify(`${connected ? `${connected.text} ` : ''}${tail}`, 'info');
       runner.start();
@@ -102,7 +102,7 @@ export default function prjctExtension(pi: ExtensionAPI) {
       if (!(SERVICE_ORDER as readonly string[]).includes(id)) { ctx.ui.notify(`Unknown service "${id}". Services: ${SERVICE_ORDER.join(', ')}.`, 'error'); return; }
       const runner = await runnerFor(owner, ctx);
       if (!runner) { ctx.ui.notify('No bound project. Run /prjct init first.', 'error'); return; }
-      const queued = await runner.enqueue([id], 'run', { force: true });
+      const queued = await owner.shareWalk(() => runner.enqueue([id], 'run', { force: true }));
       ctx.ui.notify(queued.length ? `Queued: ${queued.join(', ')}.` : `${id} is already queued or running.`, 'info');
       runner.start();
       if (!ctx.hasUI) await runner.idle();
@@ -111,7 +111,7 @@ export default function prjctExtension(pi: ExtensionAPI) {
     if (head === 'analyze') {
       const runner = await runnerFor(owner, ctx);
       if (!runner) { ctx.ui.notify('No bound project. Run /prjct init first.', 'error'); return; }
-      const queued = await runner.enqueue([...MODEL_SERVICES], 'analyze', { force: true });
+      const queued = await owner.shareWalk(() => runner.enqueue([...MODEL_SERVICES], 'analyze', { force: true }));
       ctx.ui.notify(queued.length ? `Queued: ${queued.join(', ')} (child Pi, ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : 'default model'}, thinking low). /prjct status follows progress.` : 'Analysis services are already queued or running.', 'info');
       runner.start();
       if (!ctx.hasUI) await runner.idle();
