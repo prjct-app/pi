@@ -163,6 +163,8 @@ export default function prjctExtension(pi: ExtensionAPI) {
     if (isChildJob()) return;
     try {
       const owner = runtime(ctx.cwd, ctx.sessionManager?.getSessionId() ?? attempt);
+      // Live source watcher: hooks and lookups re-stat only what changed.
+      await owner.watchSources().catch(() => false);
       const runner = await runnerFor(owner, ctx);
       if (!runner) return;
       await runner.resume();
@@ -185,7 +187,14 @@ export default function prjctExtension(pi: ExtensionAPI) {
     } catch { /* Uninitialized projects do not record. */ }
     return { action: 'continue' as const };
   });
+  // While the agent is idle a full walk is free: it corrects anything the watcher missed.
+  pi.on('agent_settled', (_event, ctx) => {
+    if (isChildJob()) return;
+    const owner = runtimes.get(`${ctx.sessionManager?.getSessionId() ?? attempt}:${ctx.cwd}`);
+    void owner?.revalidateSources().catch(() => undefined);
+  });
   pi.on('session_shutdown', async () => {
+    for (const owner of runtimes.values()) owner.unwatchSources();
     await stopRunners();
     await Promise.allSettled([...runtimes.values()].map(owner => owner.flush()));
     runtimes.clear(); executions.clear();

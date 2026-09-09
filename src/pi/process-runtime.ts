@@ -600,6 +600,12 @@ export class ProcessRuntime {
   /** Persist caches; called at session shutdown. */
   async flush(): Promise<void> { await this.sourceCache?.persist(); }
 
+  /** Start the live source watcher (session_start). Returns false when unsupported. */
+  async watchSources(): Promise<boolean> { return (await this.sources()).watch(); }
+  unwatchSources(): void { this.sourceCache?.unwatch(); }
+  /** Full walk in the background (agent idle): bounds what a missed watcher event could hide. */
+  async revalidateSources(): Promise<void> { await (await this.sources()).revalidate(); }
+
   private async load(key: string): Promise<Document> {
     const staged = this.transaction.getStore()?.pending;
     const record = staged && this.keyOf(staged) === key ? { payload: staged, revision: staged.revision } : await readRecordCached(this.statePath(key));
