@@ -329,14 +329,30 @@ export class SourceCache {
     }
   }
 
-  private applyDirty(): Promise<void> {
-    if (this.applying) return this.applying;
-    if (!this.dirtyPaths.size) return Promise.resolve();
-    const batch = this.dirtyPaths;
-    this.dirtyPaths = new Set();
-    this.applying = Promise.all([...batch].map(path => this.io.run(() => this.reconcile(path)))).then(() => undefined)
-      .finally(() => { this.applying = undefined; });
-    return this.applying;
+  private async applyDirty(): Promise<void> {
+    if (this.applying) await this.applying;
+    while (this.dirtyPaths.size) {
+      const batch = this.dirtyPaths;
+      this.dirtyPaths = new Set();
+      this.applying = (async () => {
+        const paths = [...batch];
+        await Promise.all(paths.map(path => this.io.run(() => this.reconcile(path))));
+        // Recursive watchers may coalesce a removed subtree into an event for
+        // only one child. Reconcile that child's ancestors so a missing sibling
+        // or directory still removes every cached descendant, without a tree walk.
+        const parents = new Set<string>();
+        for (const path of paths) {
+          let parent = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+          while (true) {
+            parents.add(parent);
+            if (!parent) break;
+            parent = parent.includes('/') ? parent.slice(0, parent.lastIndexOf('/')) : '';
+          }
+        }
+        for (const parent of [...parents].sort((left, right) => right.length - left.length)) await this.reconcile(parent);
+      })().finally(() => { this.applying = undefined; });
+      await this.applying;
+    }
   }
 
   private async reconcile(relativePath: string): Promise<void> {

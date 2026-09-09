@@ -86,6 +86,27 @@ test('live watcher: edits, adds, deletes, renames and new directories are reflec
   assert.equal(cache.live, false);
 });
 
+test('a coalesced child event removes its deleted directory subtree', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'prjct-watch-coalesced-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, 'lib/inner'), { recursive: true });
+  await writeFile(join(root, 'lib/index.ts'), 'export * from "./inner/x.ts";\n');
+  await writeFile(join(root, 'lib/inner/x.ts'), 'export const x = 1;\n');
+  const cache = new SourceCache(root);
+  await cache.snapshot({ fresh: true });
+  await rm(join(root, 'lib'), { recursive: true });
+
+  // FSEvents can report only one child of a recursively removed directory.
+  const internals = cache as unknown as {
+    dirtyPaths: Set<string>;
+    applyDirty(): Promise<void>;
+    assemble(via: 'watch'): { hashes: Record<string, string> };
+  };
+  internals.dirtyPaths.add('lib/index.ts');
+  await internals.applyDirty();
+  assert.deepEqual(internals.assemble('watch').hashes, Object.create(null));
+});
+
 test('PRJCT_WATCH=0 keeps the walk-only behaviour', async t => {
   const root = await mkdtemp(join(tmpdir(), 'prjct-nowatch-'));
   t.after(() => rm(root, { recursive: true, force: true }));
