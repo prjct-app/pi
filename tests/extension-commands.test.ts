@@ -36,6 +36,71 @@ const stubCtx = (cwd: string, notices: string[]) => ({
   ui: { notify: (text: string) => notices.push(text), setStatus: () => undefined },
 });
 
+test('headless commands keep the user informed: every command and job lifecycle event reaches stderr', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'prjct-headless-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'client'), agentHome = join(root, 'agent');
+  await mkdir(cwd); await mkdir(agentHome);
+  await writeFile(join(cwd, 'README.md'), '# Client\n');
+  const previousEnv = { ...process.env };
+  process.env.PI_CODING_AGENT_DIR = agentHome;
+  process.env.PRJCT_HOME = join(root, 'store');
+  process.env.PRJCT_PI_COMMAND = `${process.execPath} ${fileURLToPath(new URL('./fake-pi.mjs', import.meta.url))}`;
+  t.after(() => { process.env = previousEnv; });
+
+  const host = stubHost();
+  prjctExtension(host.pi);
+  const notices: string[] = [];
+  const ctx = { ...stubCtx(cwd, notices), mode: 'print' as const };
+  const run = (args: string) => host.commands.get('prjct')!(args, ctx);
+
+  const errLines: string[] = [];
+  const originalConsoleError = console.error;
+  console.error = (...values: unknown[]) => { errLines.push(values.map(String).join(' ')); };
+  t.after(() => { console.error = originalConsoleError; });
+  const errText = () => errLines.join('\n');
+
+  await run('status');
+  assert.match(errLines.at(-1) ?? '', /No bound project\. Run \/prjct init first\./);
+  assert.equal(notices.length, 0, 'headless mode never calls the no-op UI');
+
+  await run('init');
+  assert.match(errText(), /Project initialized\. Connected project p_[0-9a-f]+ .*Queued: index, stack, history\./);
+  assert.match(errText(), /prjct index…/);
+  assert.match(errText(), /prjct index done \([\d.]+s\):/);
+  assert.match(errText(), /prjct: 3 service\(s\) finished: index, stack, history\. \/prjct status/);
+
+  await run('status');
+  assert.match(errLines.at(-1) ?? '', /index\s+done/);
+
+  // Re-init after an edit refreshes only what changed; it never re-creates.
+  await writeFile(join(cwd, 'NOTES.md'), '# Notes\n');
+  await run('init');
+  assert.match(errText(), /Project already initialized\. Reconnected project p_[0-9a-f]+ .*Refreshing out-of-date services: index, stack\. \/prjct status follows progress\./);
+  assert.match(errText(), /prjct: 2 service\(s\) finished: index, stack\. \/prjct status/);
+
+  // A failing service is reported where the user can see it, not only appended.
+  process.env.FAKE_PI_MODE = 'fail';
+  await run('analyze');
+  assert.match(errText(), /prjct purpose failed: child pi exited 3/);
+  assert.match(errText(), /prjct patterns failed: child pi exited 3/);
+  delete process.env.FAKE_PI_MODE;
+
+  await run('run nope');
+  assert.match(errLines.at(-1) ?? '', /Unknown service "nope"/);
+  await run('export');
+  assert.match(errLines.at(-1) ?? '', /^Usage: \/prjct export <path>/);
+  await run('work');
+  assert.match(errLines.at(-1) ?? '', /No work yet\. \/prjct work "title" starts a cycle\./);
+  await run('ship');
+  assert.ok((errLines.at(-1) ?? '').length > 0, 'ship always answers');
+  await run('bogus');
+  assert.match(errLines.at(-1) ?? '', /^Usage:/);
+  assert.equal(notices.length, 0, 'no headless feedback was lost to the no-op UI');
+
+  for (const handler of host.handlers.get('session_shutdown') ?? []) await handler({}, ctx);
+});
+
 test('/prjct init connects and runs services without prompting the model; status, run and analyze behave', async t => {
   const root = await mkdtemp(join(tmpdir(), 'prjct-cmd-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -51,18 +116,27 @@ test('/prjct init connects and runs services without prompting the model; status
 
   const host = stubHost();
   prjctExtension(host.pi);
+  assert.deepEqual([...host.commands.keys()], ['prjct'], 'only /prjct is registered; the /p alias is gone');
   const notices: string[] = [];
   const ctx = stubCtx(cwd, notices);
-  const run = (args: string) => host.commands.get('p')!(args, ctx);
+  const run = (args: string) => host.commands.get('prjct')!(args, ctx);
 
   await run('status');
   assert.match(notices.at(-1) ?? '', /No bound project/);
 
   await run('init');
-  assert.match(notices.at(-1) ?? '', /Connected project p_[0-9a-f]+ .*2 indexable files\. Queued: index, stack, history\./);
+  assert.match(notices.at(-1) ?? '', /Project initialized\. Connected project p_[0-9a-f]+ .*2 indexable files\. Queued: index, stack, history\./);
   assert.equal(host.sent.length, 0, 'init must not drive the model');
   assert.equal(host.entries.filter(entry => (entry as { status: string }).status === 'done').length, 3);
   assert.deepEqual((await readdir(cwd)).sort(), ['README.md', 'index.ts']);
+
+  const headlessOutput: string[] = [];
+  const originalConsoleError = console.error;
+  console.error = (...values: unknown[]) => { headlessOutput.push(values.map(String).join(' ')); };
+  const headlessCtx = ctx as typeof ctx & { mode?: string };
+  headlessCtx.mode = 'print';
+  try { await run('init'); } finally { delete headlessCtx.mode; console.error = originalConsoleError; }
+  assert.match(headlessOutput.at(-1) ?? '', /Project already initialized\. Reconnected project p_[0-9a-f]+ .*All services are current\./);
 
   await run('status');
   const status = notices.at(-1) ?? '';
