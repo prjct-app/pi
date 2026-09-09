@@ -9,6 +9,7 @@ import { checkMutationPreconditions } from '../workspace/mutation-preconditions.
 import { publishRecord, readRecord, readRecordCached, readRevision, type Durability } from '../workspace/store.ts';
 import { observeEvidence } from '../knowledge/evidence.ts';
 import { redactSecrets } from '../knowledge/redact.ts';
+import { outlineOf } from '../knowledge/digest.ts';
 import { validateSearchResult } from '../knowledge/search-result.ts';
 import { reverseImports } from '../representation/imports.ts';
 import { scoreLexical, symbolMatchesQuery, tokenizeQuery } from '../representation/lexical.ts';
@@ -238,6 +239,7 @@ export class ProcessRuntime {
     const manifest = await readRecordCached(this.representationPartPath(key, 'manifest'));
     const pins = (manifest?.payload as { parts?: Record<string, Ref> } | undefined)?.parts;
     if (!manifest || !pins) return undefined; // Legacy index requires explicit rebuild.
+    if ((manifest.payload as { configRevision?: number }).configRevision !== INDEX_CONFIG_REVISION) return undefined; // Older encoding: treat as not applied until the next sync rebuilds it.
     if (this.indexCache?.manifestHash === manifest.contentHash) return this.indexCache.index;
     const [lexical, graph] = await Promise.all(['lexical', 'graph'].map(async part => {
       const pin = pins[part];
@@ -794,7 +796,9 @@ export class ProcessRuntime {
       const items: Array<{ kind: 'stack' | 'architecture' | 'purpose' | 'method' | 'history' | 'design'; summary: string; standing: 'supported' | 'needs_review'; sources: Ref[] }> = [];
       const gaps: string[] = [];
       if (index && index.manifestHash !== current.manifestHash) gaps.push('Sources changed; review supported knowledge before applying it.');
-      if (index) {
+      const docItems = await this.contextDocItems(request.query, bound.projectId);
+      // The stack brief subsumes the mechanical profile lines: never serve both.
+      if (index && !docItems.some(item => item.kind === 'stack')) {
         const profile = index.profile;
         const scriptNames = Object.keys(profile.scripts);
         items.push({ kind: 'stack', standing: 'supported',
@@ -828,10 +832,10 @@ export class ProcessRuntime {
       // budget still returns their obs_ ids (the confirm step depends on them).
       const pathQuery = /[\/.]\w/.test(request.query);
       const observationItems = !work ? this.contextObservations(state, request.query).map(observation => ({ kind: 'method' as const,
-        summary: `observation ${observation.id}: ${observation.execution?.sourcePaths?.join(', ') ?? ''} ${observation.summary.slice(0, 1800)}`,
+        summary: `observation ${observation.id}: ${observation.execution?.sourcePaths?.join(', ') ?? ''} ${observation.summary.slice(0, 900)}`,
         standing: observation.provenance === 'native_observation' ? 'supported' as const : 'needs_review' as const, sources: observation.supports })) : [];
       if (pathQuery) items.push(...observationItems);
-      items.push(...await this.contextDocItems(request.query, bound.projectId));
+      items.push(...docItems);
       for (const claim of state.claims.filter(item => item.standing === 'supported').slice(0, 8)) {
         items.push({ kind: 'architecture', summary: claim.statement, standing: claim.supports.some(support => this.staleSupport(support, current)) ? 'needs_review' : 'supported',
           sources: claim.supports.length ? claim.supports : [contentRef(claim.id, 1, claim)] });
@@ -866,7 +870,7 @@ export class ProcessRuntime {
         standing: 'supported' as const, sources: [contentRef(entry.id, 1, entry)] });
     }
     for (const observation of this.contextObservations(state, request.query, work.id)) {
-      items.push({ kind: 'work' as const, summary: `observation ${observation.id}: ${observation.execution?.sourcePaths?.join(', ') ?? ''} ${observation.summary}`,
+      items.push({ kind: 'work' as const, summary: `observation ${observation.id}: ${observation.execution?.sourcePaths?.join(', ') ?? ''} ${observation.summary.slice(0, 900)}`,
         standing: 'supported' as const, sources: observation.supports.length ? observation.supports : [contentRef(observation.id, 1, observation)] });
     }
     const gaps: string[] = [...projectGaps];
@@ -1902,6 +1906,13 @@ export class ProcessRuntime {
         const hits = [...scores.entries()].map(([path, entry]) => ({ path, ...entry }))
           .sort((left, right) => right.score - left.score);
         const hitIds = new Set(hits.slice(0, request.maxItems).map(hit => sourceId(hit.path)));
+        // Outlines let the agent answer from signatures instead of reading whole files;
+        // only the top hits carry one, and short, so search stays cheaper than a read.
+        const outlines: Record<string, string> = Object.create(null);
+        for (const file of await (await this.sources()).read(hits.slice(0, Math.min(3, request.maxItems)).map(hit => hit.path))) {
+          const outline = outlineOf(file.content, 8, 480);
+          if (outline) outlines[file.relativePath] = outline;
+        }
         for (const hit of hits) {
           const contentHash = stored.hashes[hit.path];
           if (!contentHash) continue;
@@ -1910,6 +1921,7 @@ export class ProcessRuntime {
           if (hit.symbol) reasons.push(`Declares symbol ${hit.symbol}.`);
           items.push({
             kind: 'source', reference, summary: hit.path, applicability: fresh ? 'current' : 'stale',
+            ...(outlines[hit.path] ? { outline: outlines[hit.path]! } : {}),
             sources: [reference], reasons, readPath: hit.path,
           });
         }

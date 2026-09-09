@@ -76,6 +76,11 @@ test('init connects without indexing; services then produce the index, stack and
   assert.equal(stackItem.standing, 'supported');
   assert.equal(historyItem.sources[0]?.id, 'ctx_history');
   assert.match(await runtime.understandingText(), /not synthesized yet/);
+  // Search hits carry an outline so the agent can skip full reads; the stack brief replaces the profile lines.
+  const search = await runtime.execute('prjct_search', { checkoutId: id.checkoutId, query: 'main helper', maxBytes: 8000, maxItems: 5 });
+  const hit = (search.details as { items: Array<{ kind: string; summary: string; outline?: string }> }).items.find(item => item.summary === 'src/app.ts');
+  assert.match(hit?.outline ?? '', /^L2 export function main\(\)/);
+  assert.equal(items.filter(item => item.kind === 'stack').length, 1, 'profile lines are not repeated next to the stack brief');
   // Model prompts are grounded in facts so the child never guesses ids or paths.
   const facts = await runtime.analysisFacts();
   assert.equal(facts.checkoutId, id.checkoutId);

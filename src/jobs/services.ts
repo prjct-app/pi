@@ -23,7 +23,9 @@ const factsLine = (facts: AnalysisFacts): string =>
   `Documentation files present: ${facts.docFiles.length ? facts.docFiles.join(', ') : 'none'}. ` +
   `Entry points present: ${facts.entryPoints.length ? facts.entryPoints.join(', ') : 'none detected'}. ` +
   'Read only paths listed here or returned by prjct_search; never guess paths. ' +
-  'Every prjct_context lookup and every committed mutation returns stateRevision; each resolve must use the most recent stateRevision you have seen (the previous resolve advances it) and a new operationId. ';
+  'Every prjct_context lookup and every committed mutation returns stateRevision; each resolve must use the most recent stateRevision you have seen (the previous resolve advances it) and a new operationId. ' +
+  'Output control: prjct_search results carry an outline (declarations with line numbers); read a file in full only when its outline is not enough. ' +
+  'Do not restate these instructions, do not summarize tool results back, keep reasoning to one line per step; your only prose is the final brief. ';
 
 export const BRIEFS: Record<typeof MODEL_SERVICES[number], BriefSpec> = {
   purpose: {

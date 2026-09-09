@@ -6,6 +6,7 @@ import { ProcessRuntime, type HostExecution } from './pi/process-runtime.ts';
 import { createProcessTools, processToolNames } from './pi/register-tools.ts';
 import { newId } from './workspace/ids.ts';
 import { redactSecrets } from './knowledge/redact.ts';
+import { digestToolResult } from './knowledge/digest.ts';
 import { JobRunner, formatJobs, type RunnerEvent } from './jobs/runner.ts';
 import { MECHANICAL_SERVICES, MODEL_SERVICES, SERVICE_ORDER, createServices } from './jobs/services.ts';
 
@@ -215,7 +216,10 @@ export default function prjctExtension(pi: ExtensionAPI) {
     if (!entry) return;
     executions.delete(event.toolCallId);
     try {
-      const text = redactSecrets(JSON.stringify(event.result ?? {}).slice(0, 3800));
+      // Digest, never echo: the agent already holds the tool output; evidence needs its shape.
+      const digest = digestToolResult(event.toolName, event.result as Parameters<typeof digestToolResult>[1],
+        { ...(entry.captured.sourcePaths?.[0] ? { path: entry.captured.sourcePaths[0] } : {}), ...(entry.captured.command ? { command: entry.captured.command } : {}) });
+      const text = redactSecrets(digest.text);
       await entry.owner.recordObservation(`${event.toolName} ${event.isError ? 'failed' : 'completed'}: ${text}`, {
         ...entry.captured, outcome: ctx.signal?.aborted || !entry.captured.beforeHash ? 'unknown' : event.isError ? 'failed' : 'succeeded',
       });

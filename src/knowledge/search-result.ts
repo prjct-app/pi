@@ -15,6 +15,8 @@ export const SearchResultSchema = Type.Object({
     sources: Type.Array(ContentReferenceSchema, { minItems: 1, maxItems: 16 }),
     reasons: Type.Array(text, { minItems: 1, maxItems: 8 }),
     readPath: Type.Optional(Type.String({ minLength: 1, maxLength: 4096 })),
+    /** Declarations with line numbers, so the agent can decide whether a full read is needed. */
+    outline: Type.Optional(Type.String({ minLength: 1, maxLength: 1200 })),
   }, { additionalProperties: false }), { maxItems: 32 }),
   gaps: Type.Array(text, { maxItems: 32 }), next: Type.Optional(PageCursorSchema),
 }, { additionalProperties: false });
