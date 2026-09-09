@@ -1,0 +1,7 @@
+node_modules/
+.test-data/
+evidence/
+*.tgz
+.DS_Store
+.npm-cache/
+evidence-summary.json
