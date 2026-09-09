@@ -127,3 +127,20 @@ test('publishing a document keeps prior revisions instead of overwriting history
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('light durability still keeps history, the lock, and the revision check', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'prjct-light-'));
+  try {
+    const path = join(root, 'state.json');
+    await publishRecord(path, { expectedRevision: 0, payload: { v: 1 }, durability: 'light' });
+    await publishRecord(path, { expectedRevision: 1, payload: { v: 2 }, durability: 'light' });
+    assert.deepEqual((await readRevision(path, 1))?.payload, { v: 1 });
+    assert.deepEqual((await readRevision(path, 2))?.payload, { v: 2 });
+    assert.deepEqual((await readRecord(path))?.payload, { v: 2 });
+    await assert.rejects(() => publishRecord(path, { expectedRevision: 1, payload: { v: 3 }, durability: 'light' }), { code: 'STALE_REVISION' });
+    await writeFile(`${path}.lock`, '');
+    await assert.rejects(() => publishRecord(path, { expectedRevision: 2, payload: { v: 3 }, durability: 'light' }), { code: 'STORE_LOCKED' });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

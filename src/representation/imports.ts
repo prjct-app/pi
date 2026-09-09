@@ -14,7 +14,7 @@ const extractImportSources = (content: string): string[] => {
   return sources;
 };
 
-const resolveImport = (source: string, fromFile: string, files: Set<string>): string | undefined => {
+const resolveImport = (source: string, fromFile: string, files: ReadonlySet<string>): string | undefined => {
   const base = source.startsWith('@/')
     ? posix.join('src', source.slice(2))
     : posix.normalize(posix.join(posix.dirname(fromFile), source));
@@ -25,13 +25,16 @@ const resolveImport = (source: string, fromFile: string, files: Set<string>): st
   return undefined;
 };
 
+export const resolveImportsOf = (file: { path: string; content: string }, known: ReadonlySet<string>): string[] =>
+  [...new Set(extractImportSources(file.content)
+    .map(source => resolveImport(source, file.path, known))
+    .filter((path): path is string => Boolean(path)))];
+
 export const buildImportGraph = (files: ReadonlyArray<{ path: string; content: string }>): ImportGraph => {
   const known = new Set(files.map(file => file.path));
   const forward: Record<string, string[]> = Object.create(null);
   for (const file of files) {
-    const targets = [...new Set(extractImportSources(file.content)
-      .map(source => resolveImport(source, file.path, known))
-      .filter((path): path is string => Boolean(path)))];
+    const targets = resolveImportsOf(file, known);
     if (targets.length) forward[file.path] = targets;
   }
   return { forward };

@@ -1,6 +1,6 @@
 {
   "name": "prjct",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "prjct: persistent project understanding, method discipline, and cross-session continuity for Pi. Explicit init, on-demand methods, evidence-gated work.",
@@ -20,6 +20,8 @@
     "themes": []
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
   },
   "devDependencies": {

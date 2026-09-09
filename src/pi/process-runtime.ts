@@ -4,11 +4,12 @@ import { mkdir, writeFile, readFile, realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { contentRef, newId, sha256 } from '../workspace/ids.ts';
-import { assertStoreOutsideSource, bindIdentity, projectKey, resolveIdentity, scopeStore } from '../workspace/identity.ts';
+import { assertStoreOutsideSource, bindIdentity, projectKey, resolveIdentity, scopeStore, type IdentityResolution } from '../workspace/identity.ts';
 import { checkMutationPreconditions } from '../workspace/mutation-preconditions.ts';
-import { publishRecord, readRecord, readRevision } from '../workspace/store.ts';
+import { publishRecord, readRecord, readRecordCached, readRevision, type Durability } from '../workspace/store.ts';
 import { observeEvidence } from '../knowledge/evidence.ts';
 import { redactSecrets } from '../knowledge/redact.ts';
+import { outlineOf } from '../knowledge/digest.ts';
 import { validateSearchResult } from '../knowledge/search-result.ts';
 import { reverseImports } from '../representation/imports.ts';
 import { scoreLexical, symbolMatchesQuery, tokenizeQuery } from '../representation/lexical.ts';
@@ -17,9 +18,13 @@ import { describeRefresh } from '../representation/refresh-view.ts';
 import { INDEX_CONFIG_REVISION } from '../representation/skip.ts';
 import { validateStructureResult } from '../representation/structure-result.ts';
 import {
-  buildProjectIndex, collectIndexable, diffHashes, reviveProjectIndex, sourceId,
-  type ProjectIndex,
+  buildProjectIndex, diffHashes, reviveProjectIndex, sourceId, updateProjectIndex,
+  type BuildOptions, type CollectedSources, type ProjectIndex,
 } from '../representation/sync.ts';
+import { readdir, rm } from 'node:fs/promises';
+import { SourceCache, type SourceSnapshot } from '../representation/source-cache.ts';
+import { collectHistory, gitHead, renderHistory, type ProjectHistory } from '../jobs/history.ts';
+import { renderStack } from '../jobs/stack.ts';
 import { assertMethodProgress, METHOD_STAGES } from '../work/method-progress.ts';
 import { assertReuseAssessment } from '../work/checkpoint-contract.ts';
 import { listMethodDocuments, loadMethodDocument, matchMethods, methodCatalog } from '../methods/registry.ts';
@@ -62,6 +67,10 @@ type Document = { projectId: string; checkoutId: string; location: string; day: 
 };
 
 export type ToolResult = { content: Array<{ type: 'text'; text: string }>; details: unknown };
+// Current checkout state as evidence sees it: manifest hash plus per-source hashes keyed by src_ id.
+type CurrentSources = Readonly<{ manifestHash: string; hashes: Record<string, string>; byId: Map<string, string> }>;
+// Index metadata without the heavy lexical/graph parts (manifest.json only).
+type IndexManifest = Readonly<Omit<ProjectIndex, 'lexical' | 'imports' | 'symbols' | 'cochange'> & { parts?: Record<string, Ref> }>;
 
 const fail = (code: string, message: string): never => {
   throw Object.assign(new Error(message), { code });
@@ -101,6 +110,11 @@ export class ProcessRuntime {
   readonly attemptId: string;
   readonly sessionId: string;
   private selection: string | null | undefined;
+  private sourceCache: SourceCache | undefined;
+  private identityPromise: Promise<IdentityResolution> | undefined;
+  private currentCache: { generation: number; current: CurrentSources } | undefined;
+  private walkShare = new AsyncLocalStorage<{ snapshot?: Promise<SourceSnapshot> }>();
+  private indexCache: { manifestHash: string; index: ProjectIndex } | undefined;
   private transaction = new AsyncLocalStorage<{ params: Record<string, unknown>; hash: string; pending?: Document; baseRevision?: number; files?: Array<{ path: string; content: string; overwrite?: boolean }>; confirm?: (message: string) => Promise<boolean> }>();
   constructor(options: ProcessRuntimeOptions) {
     this.agentHome = options.agentHome;
@@ -113,7 +127,7 @@ export class ProcessRuntime {
 
   async statusText(): Promise<string> {
     const bound = await this.peekBinding();
-    if (!bound) return 'No work selected. Run /prjct init to create the store and run the first index and analysis; /prjct work starts work afterwards. Trivial questions do not need this.';
+    if (!bound) return 'No work selected. Run /prjct init to connect the project (index, stack and history run in the background); /prjct analyze synthesizes understanding; /prjct work starts work afterwards. Trivial questions do not need this.';
     const state = await this.load(this.keyOf(bound));
     const work = state.works.find(item => item.id === state.selectedWorkId);
     return work
@@ -124,7 +138,8 @@ export class ProcessRuntime {
   async execute(name: string, params: Record<string, unknown>, extras: { signal?: AbortSignal; activate?: (names: string[]) => void; confirm?: (message: string) => Promise<boolean> } = {}): Promise<ToolResult> {
     const bound = await this.peekBinding();
     const path = bound ? this.statePath(this.keyOf(bound)) : this.locatorPath();
-    return withFileMutationQueue(path, () => this.executeQueued(name, params, extras));
+    // One tool call is one host operation: every source check inside it sees the same walk.
+    return withFileMutationQueue(path, () => this.shareWalk(() => this.executeQueued(name, params, extras)));
   }
 
   private async executeQueued(name: string, params: Record<string, unknown>, extras: { signal?: AbortSignal; activate?: (names: string[]) => void; confirm?: (message: string) => Promise<boolean> } = {}): Promise<ToolResult> {
@@ -188,21 +203,44 @@ export class ProcessRuntime {
   private representationPartPath(key: string, part: 'manifest' | 'lexical' | 'graph') {
     return join(scopeStore(this.prjctRoot, key, 'representation'), `${part}.json`);
   }
+  private historyPath(key: string) { return join(scopeStore(this.prjctRoot, key, 'representation'), 'history.json'); }
+  private contextDocPath(key: string, id: string) { return join(scopeStore(this.prjctRoot, key, 'knowledge'), 'context', `${id}.json`); }
+  /** Job queue of the bound project; undefined until /prjct init. */
+  async jobsPath(): Promise<string | undefined> {
+    const bound = await this.peekBinding();
+    return bound ? join(scopeStore(this.prjctRoot, this.keyOf(bound), 'work'), 'jobs.json') : undefined;
+  }
+  /** Raw event log of the last run of a model service. */
+  async jobLogPath(id: string): Promise<string | undefined> {
+    const bound = await this.peekBinding();
+    return bound ? join(scopeStore(this.prjctRoot, this.keyOf(bound), 'work'), 'jobs', `${id.replace(/[^a-z0-9_-]/gi, '_')}.jsonl`) : undefined;
+  }
 
   async identity() { return this.previewIds(); }
 
   private async previewIds(): Promise<{ projectId: string; checkoutId: string; day: string }> {
     const bound = await this.peekBinding();
     if (bound) return bound;
-    const resolution = await resolveIdentity({ location: this.cwd, agentHome: this.agentHome });
+    const resolution = await this.resolvedIdentity();
     await assertStoreOutsideSource(resolution.location, this.prjctRoot);
     return { projectId: `p_${sha256(resolution.location).slice(0, 12)}`, checkoutId: `co_${sha256(resolution.location).slice(0, 12)}`, day: dayToday() };
   }
 
+  // Cheap metadata read (profile, hashes, revisions). Legacy manifests without
+  // part pins are not an applied index and require an explicit rebuild.
+  private async loadManifest(key: string): Promise<IndexManifest | undefined> {
+    const manifest = await readRecordCached(this.representationPartPath(key, 'manifest'));
+    const meta = manifest?.payload as IndexManifest | undefined;
+    if (!manifest || !meta?.parts) return undefined;
+    return meta;
+  }
+
   private async loadIndex(key: string): Promise<ProjectIndex | undefined> {
-    const manifest = await readRecord(this.representationPartPath(key, 'manifest'));
+    const manifest = await readRecordCached(this.representationPartPath(key, 'manifest'));
     const pins = (manifest?.payload as { parts?: Record<string, Ref> } | undefined)?.parts;
     if (!manifest || !pins) return undefined; // Legacy index requires explicit rebuild.
+    if ((manifest.payload as { configRevision?: number }).configRevision !== INDEX_CONFIG_REVISION) return undefined; // Older encoding: treat as not applied until the next sync rebuilds it.
+    if (this.indexCache?.manifestHash === manifest.contentHash) return this.indexCache.index;
     const [lexical, graph] = await Promise.all(['lexical', 'graph'].map(async part => {
       const pin = pins[part];
       if (!pin) return undefined;
@@ -213,11 +251,13 @@ export class ProcessRuntime {
     if (!manifest || !lexical || !graph) return undefined;
     const meta = manifest.payload as Omit<ProjectIndex, 'lexical' | 'imports' | 'symbols' | 'cochange'>;
     const graphPayload = graph.payload as { imports: ProjectIndex['imports']; symbols: ProjectIndex['symbols']; cochange: ProjectIndex['cochange'] };
-    return reviveProjectIndex({
+    const index = reviveProjectIndex({
       ...meta,
       lexical: lexical.payload as ProjectIndex['lexical'],
       imports: graphPayload.imports, symbols: graphPayload.symbols, cochange: graphPayload.cochange,
     });
+    this.indexCache = { manifestHash: manifest.contentHash, index };
+    return index;
   }
 
   // Versioned per component: unchanged parts keep their file and history; only
@@ -241,11 +281,47 @@ export class ProcessRuntime {
         ? current : await publishRecord(path, { expectedRevision: current?.revision ?? 0, payload, ...(signal ? { signal } : {}) });
       if (part !== 'manifest') pins[part] = { id: part, revision: record.revision, contentHash: record.contentHash };
     }
+    // Heavy parts keep only the pinned and the previous revision; the manifest keeps full history.
+    for (const part of ['lexical', 'graph'] as const) {
+      const pin = pins[part];
+      if (!pin) continue;
+      const directory = join(scopeStore(this.prjctRoot, key, 'representation'), 'revisions', `${part}.json`);
+      const entries = await readdir(directory).catch(() => [] as string[]);
+      for (const entry of entries) {
+        const revision = Number(entry.replace(/\.json$/, ''));
+        if (Number.isInteger(revision) && revision < pin.revision - 1) await rm(join(directory, entry), { force: true }).catch(() => undefined);
+      }
+    }
+  }
+
+  // Connect only: identity, store, and a stat snapshot. Indexing and analysis
+  // are services that run afterwards without blocking the session.
+  async connectProject(signal?: AbortSignal): Promise<{ text: string; projectId: string; checkoutId: string; candidateFiles: number; alreadyBound: boolean }> {
+    signal?.throwIfAborted();
+    const resolution = await this.resolvedIdentity();
+    await assertStoreOutsideSource(resolution.location, this.prjctRoot);
+    const alreadyBound = Boolean(await this.peekBinding());
+    const state = await this.bindNew(signal);
+    const sources = await this.sources();
+    const snapshot = await sources.snapshot({ fresh: true });
+    await sources.persist();
+    const text = `${alreadyBound ? 'Reconnected' : 'Connected'} project ${state.projectId} for ${resolution.location}: ${snapshot.paths.length} indexable files${snapshot.truncated ? ' (capped)' : ''}.`;
+    return { text, projectId: state.projectId, checkoutId: state.checkoutId, candidateFiles: snapshot.paths.length, alreadyBound };
+  }
+
+  /** True when no applied index exists or the checkout no longer matches it. */
+  async indexStale(): Promise<boolean> {
+    const bound = await this.peekBinding();
+    if (!bound) return true;
+    const stored = await this.loadManifest(this.keyOf(bound));
+    if (!stored || stored.configRevision !== INDEX_CONFIG_REVISION) return true;
+    const snapshot = await this.freshSnapshot();
+    return stored.manifestHash !== snapshot.manifestHash;
   }
 
   async initProject(signal?: AbortSignal): Promise<{ text: string; projectId: string; checkoutId: string; initialized: boolean; rebuilt: boolean; indexedFiles: number }> {
     signal?.throwIfAborted();
-    const resolution = await resolveIdentity({ location: this.cwd, agentHome: this.agentHome });
+    const resolution = await this.resolvedIdentity();
     await assertStoreOutsideSource(resolution.location, this.prjctRoot);
     await this.bindNew(signal);
     // init is the explicit first pass: create the store, index, and leave the
@@ -256,41 +332,218 @@ export class ProcessRuntime {
       rebuilt: synced.rebuilt, indexedFiles: synced.indexedFiles };
   }
 
-  async syncProject(signal?: AbortSignal): Promise<{ text: string; checkoutId: string; projectId: string; rebuilt: boolean; indexedFiles: number }> {
+  async syncProject(signal?: AbortSignal, onProgress?: BuildOptions['onProgress']): Promise<{ text: string; checkoutId: string; projectId: string; rebuilt: boolean; indexedFiles: number; manifestHash: string; retokenized: number }> {
     signal?.throwIfAborted();
     const bound = await this.peekBinding();
     if (!bound) fail('UNAVAILABLE', 'No bound project. Run /prjct init first.');
     const state = await this.bindNew(signal);
-    const collected = await collectIndexable(this.cwd);
-    const stored = await this.loadIndex(this.keyOf(state));
+    const sources = await this.sources();
+    // Metadata is enough to decide; the heavy parts are never parsed here.
+    const stored = await this.loadManifest(this.keyOf(state));
     const legacy = !stored ? await readRecord(this.representationPartPath(this.keyOf(state), 'manifest')) : undefined;
-    const rebuilt = !stored || stored.manifestHash !== collected.manifestHash || stored.configRevision !== INDEX_CONFIG_REVISION;
+    // Contents are read only when a rebuild is due; an unchanged tree costs one stat walk.
+    const snapshot = await sources.snapshot({ fresh: true });
+    const rebuilt = !stored || stored.manifestHash !== snapshot.manifestHash || stored.configRevision !== INDEX_CONFIG_REVISION;
     const revision = rebuilt ? (stored?.appliedRevision ?? (legacy?.payload as { appliedRevision?: number } | undefined)?.appliedRevision ?? 0) + 1 : stored!.appliedRevision;
-    const index = rebuilt
-      ? await buildProjectIndex(collected, { checkoutId: state.checkoutId, appliedRevision: revision }, this.cwd)
-      : stored;
+    const build = { ...(signal ? { signal } : {}), ...(onProgress ? { onProgress } : {}) };
+    // Same encoding and an applied index: re-tokenize only what changed.
+    const previous = rebuilt && stored && stored.configRevision === INDEX_CONFIG_REVISION ? await this.loadIndex(this.keyOf(state)).catch(() => undefined) : undefined;
+    let collected: CollectedSources = { files: [], hashes: snapshot.hashes, manifestHash: snapshot.manifestHash, skippedFiles: snapshot.skippedFiles, truncated: snapshot.truncated };
+    let index: IndexManifest = stored!;
+    let retokenized = 0;
+    if (rebuilt && previous) {
+      const changed = diffHashes(previous.hashes, snapshot.hashes);
+      const files = await sources.read([...changed.added, ...changed.modified]);
+      const next = await updateProjectIndex({ previous, changed: files, hashes: snapshot.hashes, manifestHash: snapshot.manifestHash, skippedFiles: snapshot.skippedFiles, truncated: snapshot.truncated },
+        { checkoutId: state.checkoutId, appliedRevision: revision }, this.cwd, build);
+      retokenized = next.retokenized;
+      index = next;
+      collected = { ...collected, files };
+    } else if (rebuilt) {
+      collected = await sources.collectAll();
+      index = await buildProjectIndex(collected, { checkoutId: state.checkoutId, appliedRevision: revision }, this.cwd, build);
+      retokenized = collected.files.length;
+    }
     if (rebuilt) {
-      await this.writeIndex(this.keyOf(state), index, signal);
+      await this.writeIndex(this.keyOf(state), index as ProjectIndex, signal);
       const components = ['lexical', 'imports', 'symbols', 'cochange'].map(id => ({
         id, appliedRevision: revision, appliedConfigRevision: INDEX_CONFIG_REVISION, lastAttempt: 'succeeded' as const,
       }));
       await this.save({
-        ...state, claims: state.claims.map(claim => claim.standing === 'supported' && claim.supports.some(support => this.staleSupport(support, index, collected)) ? { ...claim, standing: 'needs_review' as const, nextAction: 'Sources changed; inspect before reconfirming.' } : claim), refresh: { revision, configRevision: INDEX_CONFIG_REVISION, components },
+        ...state, claims: state.claims.map(claim => claim.standing === 'supported' && claim.supports.some(support => this.staleSupport(support, this.currentOf(collected.hashes, collected.manifestHash))) ? { ...claim, standing: 'needs_review' as const, nextAction: 'Sources changed; inspect before reconfirming.' } : claim), refresh: { revision, configRevision: INDEX_CONFIG_REVISION, components },
       }, state.revision, newId('sync'), signal);
     }
     const diff = stored ? diffHashes(stored.hashes, collected.hashes) : { added: Object.keys(collected.hashes), modified: [], deleted: [] };
     const extra = index.truncated ? ' Index truncated at the file cap.' : '';
     const text = rebuilt
-      ? `Indexed ${index.indexedFiles} files (rev ${revision}). Added ${diff.added.length}, modified ${diff.modified.length}, deleted ${diff.deleted.length}.${extra} Search uses BM25; structure uses imports. Index freshness is not project understanding.`
+      ? `Indexed ${index.indexedFiles} files (rev ${revision}, ${retokenized} re-tokenized). Added ${diff.added.length}, modified ${diff.modified.length}, deleted ${diff.deleted.length}.${extra} Search uses BM25; structure uses imports. Index freshness is not project understanding.`
       : `Index already current at rev ${revision} (${index.indexedFiles} files). Nothing to rebuild.`;
-    return { text, checkoutId: state.checkoutId, projectId: state.projectId, rebuilt, indexedFiles: index.indexedFiles };
+    return { text, checkoutId: state.checkoutId, projectId: state.projectId, rebuilt, indexedFiles: index.indexedFiles, manifestHash: index.manifestHash, retokenized };
+  }
+
+  // ---- Context documents: bounded, agent-facing briefs produced by services. ----
+
+  async readContextDoc(id: string): Promise<{ text: string; freshness: Record<string, string>; updatedAt: string; revision: number } | undefined> {
+    const bound = await this.peekBinding();
+    if (!bound) return undefined;
+    const record = await readRecordCached(this.contextDocPath(this.keyOf(bound), id));
+    if (!record) return undefined;
+    const payload = record.payload as { text: string; freshness: Record<string, string>; updatedAt: string };
+    return { ...payload, revision: record.revision };
+  }
+
+  /** Current applied manifest hash, or undefined before the first index. */
+  async indexManifestHash(): Promise<string | undefined> {
+    const bound = await this.peekBinding();
+    return bound ? (await this.loadManifest(this.keyOf(bound)))?.manifestHash : undefined;
+  }
+
+  async writeContextDoc(id: string, text: string, freshness: Record<string, string>, signal?: AbortSignal): Promise<{ changed: boolean; bytes: number }> {
+    const bound = await this.peekBinding();
+    if (!bound) return fail('UNAVAILABLE', 'No bound project. Run /prjct init first.');
+    const path = this.contextDocPath(this.keyOf(bound), id);
+    const current = await readRecordCached(path);
+    const previous = current?.payload as { text?: string } | undefined;
+    if (previous?.text === text) return { changed: false, bytes: Buffer.byteLength(text, 'utf8') };
+    await publishRecord(path, { expectedRevision: current?.revision ?? 0, payload: { text, freshness, updatedAt: new Date().toISOString() }, ...(signal ? { signal } : {}) });
+    return { changed: true, bytes: Buffer.byteLength(text, 'utf8') };
+  }
+
+  // Compared against the checkout, not the stored manifest: an edit makes the
+  // brief stale immediately, and the dependency on index orders the rebuild.
+  async stackStale(): Promise<boolean> {
+    const bound = await this.peekBinding();
+    if (!bound) return true;
+    const doc = await this.readContextDoc('stack');
+    if (!doc) return true;
+    const snapshot = await this.freshSnapshot();
+    return doc.freshness.manifestHash !== snapshot.manifestHash;
+  }
+
+  async buildStackDoc(signal?: AbortSignal): Promise<{ summary: string; freshness: Record<string, string> }> {
+    const bound = await this.peekBinding();
+    if (!bound) return fail('UNAVAILABLE', 'No bound project. Run /prjct init first.');
+    const manifest = await this.loadManifest(this.keyOf(bound));
+    if (!manifest) return fail('UNAVAILABLE', 'No applied index; the index service must run first.');
+    const text = renderStack(manifest.profile, { indexedFiles: manifest.indexedFiles, skippedFiles: manifest.skippedFiles, truncated: manifest.truncated });
+    const freshness = { manifestHash: manifest.manifestHash };
+    const written = await this.writeContextDoc('stack', text, freshness, signal);
+    return { summary: `${manifest.profile.ecosystem}; ${manifest.profile.tests.command ? `verify: ${manifest.profile.tests.command}` : 'no test command'} (${written.bytes} bytes)`, freshness };
+  }
+
+  async historyStale(): Promise<boolean> {
+    const bound = await this.peekBinding();
+    if (!bound) return true;
+    const doc = await this.readContextDoc('history');
+    if (!doc) return true;
+    return doc.freshness.head !== await gitHead(this.cwd);
+  }
+
+  async readHistory(): Promise<ProjectHistory | undefined> {
+    const bound = await this.peekBinding();
+    if (!bound) return undefined;
+    return (await readRecordCached(this.historyPath(this.keyOf(bound))))?.payload as ProjectHistory | undefined;
+  }
+
+  async buildHistory(signal?: AbortSignal): Promise<{ summary: string; freshness: Record<string, string> }> {
+    const bound = await this.peekBinding();
+    if (!bound) return fail('UNAVAILABLE', 'No bound project. Run /prjct init first.');
+    const sources = await this.sources();
+    const snapshot = await sources.snapshot();
+    const changelogPath = snapshot.paths.find(path => /^changelog\.mdx?$/i.test(path));
+    const changelog = changelogPath ? (await sources.read([changelogPath]))[0]?.content : undefined;
+    const history = await collectHistory(this.cwd, { known: new Set(snapshot.paths), ...(changelog ? { changelog } : {}), ...(signal ? { signal } : {}) });
+    const freshness = { head: history?.head ?? 'none' };
+    if (history) {
+      const path = this.historyPath(this.keyOf(bound));
+      const current = await readRecordCached(path);
+      if (current?.contentHash !== sha256(JSON.stringify(history))) await publishRecord(path, { expectedRevision: current?.revision ?? 0, payload: history, ...(signal ? { signal } : {}) });
+    }
+    const written = await this.writeContextDoc('history', renderHistory(history), freshness, signal);
+    const summary = history
+      ? `${history.commitCount} commits, ${history.releases.length} tags, ${history.commitsSinceRelease} since last release (${written.bytes} bytes)`
+      : 'no git history';
+    return { summary, freshness };
+  }
+
+  /** True when a model brief was written against a different index than the current checkout. */
+  private async briefStale(id: string): Promise<boolean> {
+    const doc = await this.readContextDoc(id);
+    if (!doc) return true;
+    const snapshot = await this.freshSnapshot();
+    return Boolean(doc.freshness.manifestHash) && doc.freshness.manifestHash !== snapshot.manifestHash;
+  }
+
+  /** Items for lookup queries that name a service brief (stack, history, purpose, patterns). */
+  private async contextDocItems(query: string, projectId: string): Promise<Array<{ kind: 'stack' | 'history' | 'purpose' | 'design'; summary: string; standing: 'supported' | 'needs_review'; sources: Ref[] }>> {
+    const q = query.toLowerCase();
+    const wanted: Array<{ id: string; kind: 'stack' | 'history' | 'purpose' | 'design'; stale: () => Promise<boolean> }> = [];
+    if (/stack|ecosystem|framework|tool|script|command|verify|test|build|lint|language|profile/.test(q)) wanted.push({ id: 'stack', kind: 'stack', stale: () => this.stackStale() });
+    if (/history|release|changelog|commit|git|ship|version|tag|hotspot|churn|contributor|recent/.test(q)) wanted.push({ id: 'history', kind: 'history', stale: () => this.historyStale() });
+    if (/purpose|what is|overview|about|goal|architecture|component|domain|brief|understand/.test(q)) wanted.push({ id: 'purpose', kind: 'purpose', stale: () => this.briefStale('purpose') });
+    if (/pattern|convention|design|style|testing|how to|guideline|pitfall|practice|structure/.test(q)) wanted.push({ id: 'patterns', kind: 'design', stale: () => this.briefStale('patterns') });
+    const items: Array<{ kind: 'stack' | 'history' | 'purpose' | 'design'; summary: string; standing: 'supported' | 'needs_review'; sources: Ref[] }> = [];
+    for (const entry of wanted) {
+      const doc = await this.readContextDoc(entry.id);
+      if (!doc) continue;
+      const standing = await entry.stale() ? 'needs_review' as const : 'supported' as const;
+      const source: Ref = { id: `ctx_${entry.id}`, revision: doc.revision, contentHash: sha256(doc.text) };
+      for (let offset = 0, part = 1; offset < doc.text.length; offset += 3800, part += 1) {
+        items.push({ kind: entry.kind, summary: `${part > 1 ? `(part ${part}) ` : ''}${doc.text.slice(offset, offset + 3800)}`, standing, sources: [source] });
+      }
+    }
+    return items;
+  }
+
+  /** Facts a model service prompt needs so the child never guesses ids or paths. */
+  async analysisFacts(): Promise<{ projectId: string; checkoutId: string; docFiles: string[]; entryPoints: string[]; testCommand?: string }> {
+    const ids = await this.previewIds();
+    const snapshot = await (await this.sources()).snapshot();
+    const docFiles = snapshot.paths.filter(path => /^(readme|context|agents|claude|contributing|architecture)\.mdx?$/i.test(path) || /^docs\/(readme|index)\.mdx?$/i.test(path)).slice(0, 6);
+    const entryPoints = snapshot.paths.filter(path => /^(src\/|lib\/|app\/)?(index|main|app|server|cli|extension)\.(ts|tsx|js|mjs|py|go|rs|rb|php)$/i.test(path)).slice(0, 6);
+    const bound = await this.peekBinding();
+    const command = bound ? (await this.loadManifest(this.keyOf(bound)))?.profile.tests.command : undefined;
+    return { projectId: ids.projectId, checkoutId: ids.checkoutId, docFiles, entryPoints, ...(command ? { testCommand: command } : {}) };
+  }
+
+  /**
+   * Portable, agent-agnostic markdown assembled from the briefs (purpose, stack,
+   * patterns, history). Returned as text; writing it anywhere is the caller's
+   * explicit, opt-in decision.
+   */
+  async exportBriefs(): Promise<{ text: string; included: string[] } | undefined> {
+    const bound = await this.peekBinding();
+    if (!bound) return undefined;
+    const included: string[] = [];
+    const sections: string[] = [];
+    for (const id of ['purpose', 'stack', 'patterns', 'history'] as const) {
+      const doc = await this.readContextDoc(id);
+      if (!doc) continue;
+      included.push(id);
+      sections.push(doc.text.trim());
+    }
+    if (!included.length) return { text: '', included };
+    const header = `<!-- Generated by prjct for ${bound.projectId} on ${new Date().toISOString().slice(0, 10)}; regenerate with /prjct export. Briefs: ${included.join(', ')}. -->\n\n`;
+    return { text: `${header}${sections.join('\n\n')}\n`, included };
+  }
+
+  /** One-line understanding status for /prjct status. */
+  async understandingText(): Promise<string> {
+    const bound = await this.peekBinding();
+    if (!bound) return 'Understanding: no bound project.';
+    const state = await this.load(this.keyOf(bound));
+    const supported = state.claims.filter(claim => claim.standing === 'supported').length;
+    const pending = state.claims.filter(claim => ['candidate', 'needs_review'].includes(claim.standing)).length;
+    const briefs = (await Promise.all(['purpose', 'patterns'].map(async id => (await this.readContextDoc(id)) ? id : undefined))).filter(Boolean);
+    if (!supported && !pending && !briefs.length) return 'Understanding: not synthesized yet. /prjct analyze runs the purpose and patterns services (bounded, child Pi).';
+    return `Understanding: briefs ${briefs.length ? briefs.join(', ') : 'none'}; ${supported} supported claim(s)${pending ? `, ${pending} pending review` : ''}.`;
   }
 
   private async peekBinding(): Promise<{ projectId: string; checkoutId: string; day: string; initialized?: boolean } | undefined> {
     // Identity lookup must not fail merely because the current cwd is the store
     // itself; only binding/indexing/writing enforce source/store separation.
-    const resolution = await resolveIdentity({ location: this.cwd, agentHome: this.agentHome });
-    const index = await readRecord(this.locatorPath());
+    const resolution = await this.resolvedIdentity();
+    const index = await readRecordCached(this.locatorPath());
     const bindings = (index?.payload as { bindings?: Array<{ location: string; projectId: string; checkoutId: string; day?: string; initialized?: boolean }> } | undefined)?.bindings ?? [];
     const found = bindings.find(item => item.location === resolution.location);
     if (found && !found.day) fail('MIGRATION_REQUIRED', 'Identity binding has no creation bucket.');
@@ -306,9 +559,58 @@ export class ProcessRuntime {
     // prjct home. Kept as a no-op so older call sites stay honest.
   }
 
+  // Identity is a property of the runtime's cwd; observe git once per runtime.
+  private resolvedIdentity(): Promise<IdentityResolution> {
+    this.identityPromise ??= resolveIdentity({ location: this.cwd, agentHome: this.agentHome })
+      .catch(error => { this.identityPromise = undefined; throw error; });
+    return this.identityPromise;
+  }
+
+  private async sources(): Promise<SourceCache> {
+    this.sourceCache ??= new SourceCache(this.cwd);
+    const bound = await this.peekBinding();
+    if (bound) this.sourceCache.bindPersistence(join(scopeStore(this.prjctRoot, this.keyOf(bound), 'representation'), 'stat-cache.json'), bound.checkoutId);
+    return this.sourceCache;
+  }
+
+  private currentOf(hashes: Record<string, string>, manifestHash: string): CurrentSources {
+    const byId = new Map<string, string>();
+    for (const [path, hash] of Object.entries(hashes)) byId.set(sourceId(path), hash);
+    return { manifestHash, hashes, byId };
+  }
+
+  // Every reader sees a walk that starts now: "did sources change during this
+  // call" must never come from an older walk. Within one host operation
+  // (shareWalk) the first walk is reused so a batch of checks costs one walk.
+  private async freshSnapshot(): Promise<SourceSnapshot> {
+    const shared = this.walkShare.getStore();
+    if (shared) { shared.snapshot ??= (await this.sources()).snapshot({ fresh: true }); return shared.snapshot; }
+    return (await this.sources()).snapshot({ fresh: true });
+  }
+
+  /** Run `fn` with one shared stat walk for every source check it performs. */
+  shareWalk<T>(fn: () => Promise<T>): Promise<T> { return this.walkShare.run({}, fn); }
+
+  private async currentSources(): Promise<CurrentSources> {
+    const snapshot = await this.freshSnapshot();
+    if (this.currentCache?.generation === snapshot.generation) return this.currentCache.current;
+    const current = this.currentOf(snapshot.hashes, snapshot.manifestHash);
+    this.currentCache = { generation: snapshot.generation, current };
+    return current;
+  }
+
+  /** Persist caches; called at session shutdown. */
+  async flush(): Promise<void> { await this.sourceCache?.persist(); }
+
+  /** Start the live source watcher (session_start). Returns false when unsupported. */
+  async watchSources(): Promise<boolean> { return (await this.sources()).watch(); }
+  unwatchSources(): void { this.sourceCache?.unwatch(); }
+  /** Full walk in the background (agent idle): bounds what a missed watcher event could hide. */
+  async revalidateSources(): Promise<void> { await (await this.sources()).revalidate(); }
+
   private async load(key: string): Promise<Document> {
     const staged = this.transaction.getStore()?.pending;
-    const record = staged && this.keyOf(staged) === key ? { payload: staged, revision: staged.revision } : await readRecord(this.statePath(key));
+    const record = staged && this.keyOf(staged) === key ? { payload: staged, revision: staged.revision } : await readRecordCached(this.statePath(key));
     if (!record) return fail('UNAVAILABLE', 'Project state is missing.');
     const stored = record.payload as Document;
     if (this.selection === undefined) this.selection = stored.selections?.[this.sessionId] ?? stored.selectedWorkId;
@@ -319,7 +621,7 @@ export class ProcessRuntime {
     };
   }
 
-  private async save(document: Document, expectedRevision: number, operationId: string, signal?: AbortSignal): Promise<Document> {
+  private async save(document: Document, expectedRevision: number, operationId: string, signal?: AbortSignal, durability: Durability = 'full'): Promise<Document> {
     const frame = this.transaction.getStore();
     operationId = String(frame?.params.operationId ?? operationId);
     const path = this.statePath(projectKey(document.day, document.projectId));
@@ -350,7 +652,7 @@ export class ProcessRuntime {
     const nextDoc: Document = { ...document, selections: { ...document.selections, [this.sessionId]: document.selectedWorkId }, revision: expectedRevision + 1,
       operations: hot };
     if (frame) { frame.baseRevision ??= expectedRevision; frame.pending = nextDoc; }
-    else await publishRecord(path, { expectedRevision, payload: nextDoc, ...(signal ? { signal } : {}) });
+    else await publishRecord(path, { expectedRevision, payload: nextDoc, durability, ...(signal ? { signal } : {}) });
     this.selection = document.selectedWorkId;
     return nextDoc;
   }
@@ -370,7 +672,7 @@ export class ProcessRuntime {
 
   private async bindNew(signal?: AbortSignal): Promise<Document> {
     signal?.throwIfAborted();
-    const resolution = await resolveIdentity({ location: this.cwd, agentHome: this.agentHome });
+    const resolution = await this.resolvedIdentity();
     await assertStoreOutsideSource(resolution.location, this.prjctRoot);
     const indexPath = this.locatorPath();
     let index = await readRecord(indexPath);
@@ -404,7 +706,7 @@ export class ProcessRuntime {
       tasks: tasks.filter(task => task.workId === work.id).map(task => contentRef(task.id, 1, task)), nextAction: work.nextAction };
   }
 
-  private contextResult(request: { action: 'lookup' | 'discover'; query: string; maxBytes: number }, result: { status: 'ok' | 'partial' | 'abstained'; items: Array<{ kind: 'stack' | 'architecture' | 'purpose' | 'design' | 'method' | 'work'; summary: string; standing: 'supported' | 'needs_review'; sources: Ref[] }>; gaps: string[] }): ToolResult {
+  private contextResult(request: { action: 'lookup' | 'discover'; query: string; maxBytes: number }, result: { status: 'ok' | 'partial' | 'abstained'; items: Array<{ kind: 'stack' | 'architecture' | 'purpose' | 'design' | 'method' | 'work' | 'history'; summary: string; standing: 'supported' | 'needs_review'; sources: Ref[] }>; gaps: string[]; stateRevision?: number }): ToolResult {
     let trimmed = false;
     while (result.items.length > 32 || (result.items.length && Buffer.byteLength(JSON.stringify(result)) > request.maxBytes)) {
       result.items.pop(); trimmed = true;
@@ -483,17 +785,20 @@ export class ProcessRuntime {
     }
     const state = await this.load(this.keyOf(bound));
     const work = state.works.find(item => item.id === state.selectedWorkId);
-    let projectItems: Array<{ kind: 'stack' | 'architecture' | 'purpose' | 'method'; summary: string; standing: 'supported' | 'needs_review'; sources: Ref[] }> = [];
+    let projectItems: Array<{ kind: 'stack' | 'architecture' | 'purpose' | 'method' | 'history' | 'design'; summary: string; standing: 'supported' | 'needs_review'; sources: Ref[] }> = [];
     let projectGaps: string[] = [];
+    // One walk per lookup, shared by the project and work blocks.
+    const current = await this.currentSources();
     {
       // Project knowledge remains present alongside a work cycle: answer what the project IS. Mechanical profile plus
       // supported claims; purpose/patterns remain agent-synthesized claims.
-      const index = await this.loadIndex(this.keyOf(bound));
-      const items: Array<{ kind: 'stack' | 'architecture' | 'purpose' | 'method'; summary: string; standing: 'supported' | 'needs_review'; sources: Ref[] }> = [];
+      const index = await this.loadManifest(this.keyOf(bound));
+      const items: Array<{ kind: 'stack' | 'architecture' | 'purpose' | 'method' | 'history' | 'design'; summary: string; standing: 'supported' | 'needs_review'; sources: Ref[] }> = [];
       const gaps: string[] = [];
-      const collected = await collectIndexable(this.cwd);
-      if (index && index.manifestHash !== collected.manifestHash) gaps.push('Sources changed; review supported knowledge before applying it.');
-      if (index) {
+      if (index && index.manifestHash !== current.manifestHash) gaps.push('Sources changed; review supported knowledge before applying it.');
+      const docItems = await this.contextDocItems(request.query, bound.projectId);
+      // The stack brief subsumes the mechanical profile lines: never serve both.
+      if (index && !docItems.some(item => item.kind === 'stack')) {
         const profile = index.profile;
         const scriptNames = Object.keys(profile.scripts);
         items.push({ kind: 'stack', standing: 'supported',
@@ -523,21 +828,29 @@ export class ProcessRuntime {
       } else {
         gaps.push('No applied index; run prjct_refresh to learn the project profile.');
       }
+      // A path-like query asks for evidence about that file: observations lead so a small
+      // budget still returns their obs_ ids (the confirm step depends on them).
+      const pathQuery = /[\/.]\w/.test(request.query);
+      const observationItems = !work ? this.contextObservations(state, request.query).map(observation => ({ kind: 'method' as const,
+        summary: `observation ${observation.id}: ${observation.execution?.sourcePaths?.join(', ') ?? ''} ${observation.summary.slice(0, 900)}`,
+        standing: observation.provenance === 'native_observation' ? 'supported' as const : 'needs_review' as const, sources: observation.supports })) : [];
+      if (pathQuery) items.push(...observationItems);
+      items.push(...docItems);
       for (const claim of state.claims.filter(item => item.standing === 'supported').slice(0, 8)) {
-        items.push({ kind: 'architecture', summary: claim.statement, standing: claim.supports.some(support => this.staleSupport(support, index, collected)) ? 'needs_review' : 'supported',
+        items.push({ kind: 'architecture', summary: claim.statement, standing: claim.supports.some(support => this.staleSupport(support, current)) ? 'needs_review' : 'supported',
           sources: claim.supports.length ? claim.supports : [contentRef(claim.id, 1, claim)] });
       }
       if (state.claims.some(claim => ['candidate', 'needs_review'].includes(claim.standing))) gaps.push('Unresolved project knowledge remains. Inspect claims and query lookup by source path or claim ID for earlier native observations.');
       if (index && !state.claims.some(item => item.standing === 'supported')) {
         gaps.push('Understanding not synthesized yet: verify key files with prjct_search, then record purpose/pattern claims via prjct_knowledge propose with linked source ids.');
       }
-      if (!work) for (const observation of this.contextObservations(state, request.query)) items.push({ kind: 'method', summary: `observation ${observation.id}: ${observation.execution?.sourcePaths?.join(', ') ?? ''} ${observation.summary.slice(0, 1800)}`, standing: observation.provenance === 'native_observation' ? 'supported' : 'needs_review', sources: observation.supports });
+      if (!pathQuery) items.push(...observationItems);
       if (!state.works.length) gaps.push('No work selected; this is the project profile, not a work brief.');
-      const result = { status: gaps.length ? 'partial' as const : 'ok' as const, items, gaps };
+      const result = { status: gaps.length ? 'partial' as const : 'ok' as const, items, gaps, stateRevision: state.revision };
       if (!work) return this.contextResult(request, result);
       projectItems = items; projectGaps = gaps.filter(gap => !gap.startsWith('No work selected'));
     }
-    const items: Array<{ kind: 'work' | 'method' | 'stack' | 'purpose' | 'architecture'; summary: string; standing: 'supported' | 'needs_review'; sources: Ref[] }> = [
+    const items: Array<{ kind: 'work' | 'method' | 'stack' | 'purpose' | 'architecture' | 'history' | 'design'; summary: string; standing: 'supported' | 'needs_review'; sources: Ref[] }> = [
       ...projectItems,
       { kind: 'work' as const, summary: `${work.title}. ${work.nextAction}`,
         standing: 'supported' as const, sources: [contentRef(work.id, 1, work)] },
@@ -557,12 +870,11 @@ export class ProcessRuntime {
         standing: 'supported' as const, sources: [contentRef(entry.id, 1, entry)] });
     }
     for (const observation of this.contextObservations(state, request.query, work.id)) {
-      items.push({ kind: 'work' as const, summary: `observation ${observation.id}: ${observation.execution?.sourcePaths?.join(', ') ?? ''} ${observation.summary}`,
+      items.push({ kind: 'work' as const, summary: `observation ${observation.id}: ${observation.execution?.sourcePaths?.join(', ') ?? ''} ${observation.summary.slice(0, 900)}`,
         standing: 'supported' as const, sources: observation.supports.length ? observation.supports : [contentRef(observation.id, 1, observation)] });
     }
     const gaps: string[] = [...projectGaps];
-    const index = await this.loadIndex(this.keyOf(bound));
-    const collected = await collectIndexable(this.cwd);
+    const index = await this.loadManifest(this.keyOf(bound));
     if (index?.profile.tests.command || (index && index.profile.tests.framework !== 'unknown')) {
       const tests = index.profile.tests;
       items.push({ kind: 'method' as const,
@@ -571,8 +883,8 @@ export class ProcessRuntime {
         sources: [{ id: `repr_${bound.projectId}`, revision: index.appliedRevision, contentHash: index.manifestHash }] });
     }
     if (!index) gaps.push('No applied index; ask for prjct_refresh when the task needs source lookup.');
-    else if (index.manifestHash !== collected.manifestHash) gaps.push('Sources changed since the last index; ask for prjct_refresh before trusting search.');
-    const result = { status: gaps.length ? 'partial' as const : 'ok' as const, items, gaps };
+    else if (index.manifestHash !== current.manifestHash) gaps.push('Sources changed since the last index; ask for prjct_refresh before trusting search.');
+    const result = { status: gaps.length ? 'partial' as const : 'ok' as const, items, gaps, stateRevision: state.revision };
     return this.contextResult(request, result);
   }
 
@@ -696,21 +1008,19 @@ export class ProcessRuntime {
   async recordObservation(summary: string, execution?: HostExecution): Promise<void> {
     const bound = await this.peekBinding();
     if (!bound) return;
-    await withFileMutationQueue(this.statePath(this.keyOf(bound)), () => this.recordObservationQueued(summary, execution));
+    await withFileMutationQueue(this.statePath(this.keyOf(bound)), () => this.recordObservationQueued(bound, summary, execution));
   }
 
-  private async recordObservationQueued(summary: string, execution?: HostExecution): Promise<void> {
-    const bound = await this.peekBinding();
-    if (!bound) return;
+  private async recordObservationQueued(bound: { projectId: string; checkoutId: string; day: string }, summary: string, execution?: HostExecution): Promise<void> {
     const state = await this.load(this.keyOf(bound));
-    const collected = await collectIndexable(this.cwd);
-    const index = await this.loadIndex(this.keyOf(bound));
+    const collected = await this.currentSources();
+    const index = await this.loadManifest(this.keyOf(bound));
     const candidates = state.tasks.filter(item => item.workId === state.selectedWorkId && item.attemptId === this.attemptId && item.grantStanding === 'valid');
     const task = candidates.length === 1 ? candidates[0] : undefined;
     const command = execution?.command?.trim();
     const verification = Boolean(command && index?.profile.tests.command && command === index.profile.tests.command.trim());
     const supports = execution?.sourcePaths?.length
-      ? collected.files.filter(file => execution.sourcePaths!.includes(file.relativePath)).map(file => ({ id: sourceId(file.relativePath), revision: index?.appliedRevision ?? 1, contentHash: file.contentHash }))
+      ? execution.sourcePaths.filter(path => collected.hashes[path] !== undefined).map(path => ({ id: sourceId(path), revision: index?.appliedRevision ?? 1, contentHash: collected.hashes[path]! }))
       : [{ id: `repr_${bound.projectId}`, revision: index?.appliedRevision ?? 1, contentHash: collected.manifestHash }];
     const redactedExecution = execution ? { ...execution, ...(execution.command ? { command: redactSecrets(execution.command) } : {}) } : undefined;
     const observed = redactedExecution && (!redactedExecution.beforeHash || redactedExecution.beforeHash === collected.manifestHash)
@@ -725,30 +1035,28 @@ export class ProcessRuntime {
     }));
     const all = [...state.observations, observation];
     const recent = new Set(all.slice(-MAX_OBSERVATIONS).map(item => item.id));
-    await this.save({ ...state, observations: all.filter(item => references.has(item.id) || recent.has(item.id)) }, state.revision, newId('obsop'));
+    await this.save({ ...state, observations: all.filter(item => references.has(item.id) || recent.has(item.id)) }, state.revision, newId('obsop'), undefined, 'light');
   }
 
   async understandingPending(): Promise<boolean> {
     const bound = await this.peekBinding();
     if (!bound) return true;
     const state = await this.load(this.keyOf(bound));
-    const index = await this.loadIndex(this.keyOf(bound));
-    const collected = await collectIndexable(this.cwd);
-    return state.claims.some(claim => ['candidate', 'needs_review'].includes(claim.standing)) || !state.claims.some(claim => claim.standing === 'supported' && claim.supports.length && claim.supports.every(ref => !this.staleSupport(ref, index, collected)));
+    const current = await this.currentSources();
+    return state.claims.some(claim => ['candidate', 'needs_review'].includes(claim.standing)) || !state.claims.some(claim => claim.standing === 'supported' && claim.supports.length && claim.supports.every(ref => !this.staleSupport(ref, current)));
   }
 
-  async sourceSnapshot(): Promise<string> { return (await collectIndexable(this.cwd)).manifestHash; }
+  async sourceSnapshot(): Promise<string> { return (await this.currentSources()).manifestHash; }
 
   private async requireEvidence(state: Document, ids: string[], scope: { workId?: string; taskId?: string }, verification = false): Promise<ObservationRow[]> {
     if (!ids.length) fail('MISSING_EVIDENCE', 'At least one actual observation is required.');
-    const index = await this.loadIndex(this.keyOf(state));
-    const collected = await collectIndexable(this.cwd);
+    const current = await this.currentSources();
     return ids.map(id => {
       const row = state.observations.find(item => item.id === id);
       if (!row) return fail('MISSING_EVIDENCE', `Observation ${id} does not exist.`);
       if (row.provenance !== 'native_observation' || !row.execution || row.execution.outcome === 'unknown') fail('UNVERIFIABLE_EVIDENCE', 'Observation has no attributable execution outcome.');
       if (scope.workId && row.workId !== scope.workId || scope.taskId && row.taskId !== scope.taskId) fail('SCOPE_MISMATCH', 'Observation belongs to another work/task.');
-      if (!row.supports.length || row.supports.some(support => this.staleSupport(support, index, collected))) fail('STALE_EVIDENCE', 'Observation no longer covers current source content.');
+      if (!row.supports.length || row.supports.some(support => this.staleSupport(support, current))) fail('STALE_EVIDENCE', 'Observation no longer covers current source content.');
       if (verification && (!row.verification || row.execution!.outcome !== 'succeeded')) fail('UNVERIFIABLE_EVIDENCE', 'Completion needs a successful project verification command.');
       return row;
     });
@@ -773,15 +1081,8 @@ export class ProcessRuntime {
     const bound = await this.peekBinding();
     if (!bound) return fail('UNAVAILABLE', 'No bound project.');
     const state = await this.load(this.keyOf(bound));
-    const index = await this.loadIndex(this.keyOf(bound));
-    const collected = await collectIndexable(this.cwd);
-    const currentById = new Map(collected.files.map(file => [sourceId(file.relativePath), file.contentHash]));
-    const staleSupport = (support: Ref): boolean => {
-      if (support.id.startsWith('repr_')) return support.contentHash !== collected.manifestHash;
-      if (support.id.startsWith('src_')) return currentById.get(support.id) !== support.contentHash;
-      return false;
-    };
-    const flagged = state.claims.filter(claim => claim.standing === 'supported' && claim.supports.some(staleSupport));
+    const current = await this.currentSources();
+    const flagged = state.claims.filter(claim => claim.standing === 'supported' && claim.supports.some(support => this.staleSupport(support, current)));
     const claims = state.claims.map(claim => flagged.includes(claim)
       ? { ...claim, standing: 'needs_review' as const, nextAction: `Re-evaluate after pivot: ${note}` }
       : claim);
@@ -799,17 +1100,11 @@ export class ProcessRuntime {
     const bound = await this.peekBinding();
     if (!bound) return fail('UNAVAILABLE', 'No bound project.');
     const state = await this.load(this.keyOf(bound));
-    const index = await this.loadIndex(this.keyOf(bound));
-    const collected = await collectIndexable(this.cwd);
-    const currentById = new Map(collected.files.map(file => [sourceId(file.relativePath), file.contentHash]));
+    const current = await this.currentSources();
     const census = { candidate: 0, supported: 0, needs_review: 0, contradicted: 0, superseded: 0 };
     let flagged = 0;
     const claims = state.claims.map(claim => {
-      const stale = claim.standing === 'supported' && claim.supports.some(support => {
-        if (support.id.startsWith('repr_')) return support.contentHash !== collected.manifestHash;
-        if (support.id.startsWith('src_')) return currentById.get(support.id) !== support.contentHash;
-        return false;
-      });
+      const stale = claim.standing === 'supported' && claim.supports.some(support => this.staleSupport(support, current));
       if (stale) flagged += 1;
       const next = stale ? { ...claim, standing: 'needs_review' as const, nextAction: 'Support no longer matches current sources.' } : claim;
       census[next.standing] += 1;
@@ -825,8 +1120,8 @@ export class ProcessRuntime {
     if (!bound) return fail('UNAVAILABLE', 'No bound project.');
     const index = await this.loadIndex(this.keyOf(bound));
     if (!index) return 'No applied index. Run /prjct sync first.';
-    const collected = await collectIndexable(this.cwd);
-    const diff = diffHashes(index.hashes, collected.hashes);
+    const current = await this.currentSources();
+    const diff = diffHashes(index.hashes, current.hashes);
     const changed = [...diff.added, ...diff.modified, ...diff.deleted];
     if (!changed.length && !diff.deleted.length) return `No changes since index rev ${index.appliedRevision}.`;
     const reverse = reverseImports(index.imports);
@@ -851,7 +1146,7 @@ export class ProcessRuntime {
 
   async listWorksText(): Promise<string> {
     const bound = await this.peekBinding();
-    if (!bound) return 'No bound project. /prjct init creates the store and runs the first index + analysis; /prjct work "title" starts a cycle afterwards.';
+    if (!bound) return 'No bound project. /prjct init connects the project and queues the index, stack and history services; /prjct work "title" starts a cycle afterwards.';
     const state = await this.load(this.keyOf(bound));
     if (!state.works.length) return 'No work yet. /prjct work "title" starts a cycle.';
     return ['Works:', ...state.works.map(work =>
@@ -868,12 +1163,9 @@ export class ProcessRuntime {
     return `Work ${workId} created and selected: ${title}. The agent drives the cycle from here.`;
   }
 
-  private staleSupport(support: Ref, index: ProjectIndex | undefined, collected: { manifestHash: string; files: readonly { relativePath: string; contentHash: string }[] }): boolean {
-    if (support.id.startsWith('repr_')) return support.contentHash !== collected.manifestHash;
-    if (support.id.startsWith('src_')) {
-      const current = collected.files.find(file => sourceId(file.relativePath) === support.id);
-      return current?.contentHash !== support.contentHash;
-    }
+  private staleSupport(support: Ref, current: CurrentSources): boolean {
+    if (support.id.startsWith('repr_')) return support.contentHash !== current.manifestHash;
+    if (support.id.startsWith('src_')) return current.byId.get(support.id) !== support.contentHash;
     return false;
   }
 
@@ -901,12 +1193,11 @@ export class ProcessRuntime {
     if (data.judgments.some(item => item.conclusion !== 'satisfied')) {
       return 'Ship refused: the work assessment has unsatisfied or unknown criteria.';
     }
-    const index = await this.loadIndex(this.keyOf(bound));
-    const collected = await collectIndexable(this.cwd);
+    const current = await this.currentSources();
     const evidenceIds = data.judgments.flatMap(item => (item as { evidenceIds?: string[] }).evidenceIds ?? []);
     const stale = state.observations.filter(item => evidenceIds.includes(item.id))
       .flatMap(item => item.supports)
-      .filter(support => this.staleSupport(support, index, collected));
+      .filter(support => this.staleSupport(support, current));
     if (stale.length) {
       return `Ship refused: evidence was recorded against older sources; re-observe after /prjct sync.`;
     }
@@ -1036,7 +1327,7 @@ export class ProcessRuntime {
           ? { attemptId: this.attemptId, generation: writerGeneration, standing: 'valid' as const, checkoutId }
           : state.grants.writer,
       };
-      const verify = (await this.loadIndex(this.keyOf(state)))?.profile.tests.command;
+      const verify = (await this.loadManifest(this.keyOf(state)))?.profile.tests.command;
       const updated: TaskRow = { ...task, attemptId: this.attemptId, grantStanding: 'valid', access, checkoutId,
         disposition: task.disposition === 'not_started' ? 'in_progress' : task.disposition,
         nextAction: access === 'write'
@@ -1071,21 +1362,22 @@ export class ProcessRuntime {
         if (!assessment) fail('INCOMPLETE_ASSESSMENT', 'Completion requires a recorded assessment.');
         const data = assessment!.data as { planRevision: number; definitionRevision: number;
           judgments: Array<{ criterionId: string; conclusion: 'satisfied' | 'unsatisfied' | 'unknown'; evidenceIds: string[] }> };
-        for (const judgment of data.judgments) await this.requireEvidence(state, judgment.evidenceIds, { workId: task.workId, taskId: task.id }, Boolean((await this.loadIndex(this.keyOf(state)))?.profile.tests.command));
+        const needsVerification = Boolean((await this.loadManifest(this.keyOf(state)))?.profile.tests.command);
+        for (const judgment of data.judgments) await this.requireEvidence(state, judgment.evidenceIds, { workId: task.workId, taskId: task.id }, needsVerification);
         const evidence = data.judgments.flatMap(item => item.evidenceIds)
           .map(id => state.observations.find(item => item.id === id))
           .filter((item): item is ObservationRow => Boolean(item))
           .map(item => ({ id: item.id, provenance: item.provenance, supports: item.supports }));
-        const collected = await collectIndexable(this.cwd);
+        const current = await this.currentSources();
         const currentSupports: Ref[] = [];
         for (const row of evidence) {
           for (const support of row.supports ?? []) {
             if (support.id.startsWith('repr_')) {
-              if (support.contentHash === collected.manifestHash) currentSupports.push(support);
+              if (support.contentHash === current.manifestHash) currentSupports.push(support);
               continue;
             }
             if (support.id.startsWith('src_')) {
-              if (collected.files.some(file => sourceId(file.relativePath) === support.id && file.contentHash === support.contentHash)) currentSupports.push(support);
+              if (current.byId.get(support.id) === support.contentHash) currentSupports.push(support);
               continue;
             }
             const rowRef = [...state.works, ...state.tasks, ...state.claims, ...state.plans].find(item => item.id === support.id);
@@ -1317,9 +1609,9 @@ export class ProcessRuntime {
     const state = await this.load(this.keyOf(bound));
     const task = state.tasks.find(item => item.id === params.taskId && item.workId === params.workId);
     if (params.action === 'inspect') {
-      const index = await this.loadIndex(this.keyOf(bound));
-      const collected = await collectIndexable(this.cwd);
-      const diff = index ? diffHashes(index.hashes, collected.hashes) : { added: [], modified: [], deleted: [] };
+      const index = await this.loadManifest(this.keyOf(bound));
+      const current = await this.currentSources();
+      const diff = index ? diffHashes(index.hashes, current.hashes) : { added: [], modified: [], deleted: [] };
       const changed = [...diff.added, ...diff.modified, ...diff.deleted];
       const observedEffects = changed.slice(0, 32).map(path => ({
         id: sourceId(path), outcome: 'unknown' as const,
@@ -1422,8 +1714,8 @@ export class ProcessRuntime {
       if (evidence.some(row => row.execution?.outcome !== 'succeeded')) fail('UNVERIFIABLE_EVIDENCE', 'Knowledge resolution needs successful source inspection.');
       const resolution = String(params.resolution);
       if (resolution === 'confirm') {
-        const index = await this.loadIndex(this.keyOf(state)); const collected = await collectIndexable(this.cwd);
-        if (claim.supports.some(support => !/^(src_|repr_)/.test(support.id) || this.staleSupport(support, index, collected))) fail('STALE_EVIDENCE', 'Claim support is missing or no longer current.');
+        const current = await this.currentSources();
+        if (claim.supports.some(support => !/^(src_|repr_)/.test(support.id) || this.staleSupport(support, current))) fail('STALE_EVIDENCE', 'Claim support is missing or no longer current.');
       }
       const replacement = params.replacement as Ref | undefined;
       if ((resolution === 'correct' || resolution === 'supersede') && replacement) {
@@ -1549,8 +1841,8 @@ export class ProcessRuntime {
     const kinds = request.kinds ?? ['source', 'claim', 'artifact'];
     const bound = await this.peekBinding();
     const stored = bound ? await this.loadIndex(this.keyOf(bound)) : undefined;
-    const collected = stored ? await collectIndexable(this.cwd) : undefined;
-    const fresh = Boolean(stored && collected && stored.manifestHash === collected.manifestHash && stored.configRevision === INDEX_CONFIG_REVISION);
+    const current = stored ? await this.currentSources() : undefined;
+    const fresh = Boolean(stored && current && stored.manifestHash === current.manifestHash && stored.configRevision === INDEX_CONFIG_REVISION);
     const items: Array<{
       kind: 'source' | 'claim' | 'artifact'; reference: Ref; summary: string; applicability: 'current' | 'stale' | 'unknown';
       sources: Ref[]; reasons: string[]; readPath?: string;
@@ -1614,6 +1906,13 @@ export class ProcessRuntime {
         const hits = [...scores.entries()].map(([path, entry]) => ({ path, ...entry }))
           .sort((left, right) => right.score - left.score);
         const hitIds = new Set(hits.slice(0, request.maxItems).map(hit => sourceId(hit.path)));
+        // Outlines let the agent answer from signatures instead of reading whole files;
+        // only the top hits carry one, and short, so search stays cheaper than a read.
+        const outlines: Record<string, string> = Object.create(null);
+        for (const file of await (await this.sources()).read(hits.slice(0, Math.min(3, request.maxItems)).map(hit => hit.path))) {
+          const outline = outlineOf(file.content, 8, 480);
+          if (outline) outlines[file.relativePath] = outline;
+        }
         for (const hit of hits) {
           const contentHash = stored.hashes[hit.path];
           if (!contentHash) continue;
@@ -1622,6 +1921,7 @@ export class ProcessRuntime {
           if (hit.symbol) reasons.push(`Declares symbol ${hit.symbol}.`);
           items.push({
             kind: 'source', reference, summary: hit.path, applicability: fresh ? 'current' : 'stale',
+            ...(outlines[hit.path] ? { outline: outlines[hit.path]! } : {}),
             sources: [reference], reasons, readPath: hit.path,
           });
         }
@@ -1697,11 +1997,11 @@ export class ProcessRuntime {
       validateStructureResult(request, result);
       return jsonResult(result);
     }
-    const collected = await collectIndexable(this.cwd);
-    const fresh = stored.manifestHash === collected.manifestHash && stored.configRevision === INDEX_CONFIG_REVISION;
+    const current = await this.currentSources();
+    const fresh = stored.manifestHash === current.manifestHash && stored.configRevision === INDEX_CONFIG_REVISION;
     const byId = new Map(Object.keys(stored.hashes).map(path => [sourceId(path), path]));
     // Impact without seeds derives them from the working-tree diff.
-    const diff = diffHashes(stored.hashes, collected.hashes);
+    const diff = diffHashes(stored.hashes, current.hashes);
     const derived = request.action === 'impact' && request.seeds.length === 0;
     const seedPaths = derived
       ? [...diff.added, ...diff.modified, ...diff.deleted]
@@ -1793,11 +2093,11 @@ export class ProcessRuntime {
   private async refresh(params: Record<string, unknown>, signal?: AbortSignal) {
     const ids = await this.previewIds();
     if (String(params.checkoutId) !== ids.checkoutId) fail('CHECKOUT_MISMATCH', `This checkout is ${ids.checkoutId}; refresh named ${String(params.checkoutId)}. Use the id from prjct_context discover.`);
-    const collected = await collectIndexable(this.cwd);
+    const current = await this.currentSources();
     const bound = await this.peekBinding();
     const stored = bound ? await this.loadIndex(this.keyOf(bound)) : undefined;
     const legacy = bound && !stored ? await readRecord(this.representationPartPath(this.keyOf(bound), 'manifest')) : undefined;
-    const rebuilt = !stored || stored.manifestHash !== collected.manifestHash || stored.configRevision !== INDEX_CONFIG_REVISION;
+    const rebuilt = !stored || stored.manifestHash !== current.manifestHash || stored.configRevision !== INDEX_CONFIG_REVISION;
     const revision = rebuilt ? (stored?.appliedRevision ?? (legacy?.payload as { appliedRevision?: number } | undefined)?.appliedRevision ?? 0) + 1 : stored!.appliedRevision;
     const observed = { checkoutId: ids.checkoutId, revision, configRevision: INDEX_CONFIG_REVISION };
     const required = ['lexical', 'imports', 'symbols', 'cochange'];
@@ -1814,10 +2114,12 @@ export class ProcessRuntime {
       validateStateResult('prjct_refresh', { action: 'apply', checkoutId: ids.checkoutId, maxBytes: Number(params.maxBytes) }, result);
       if (!bound) return fail('UNAVAILABLE', 'No bound project. Run /prjct init first.');
       const state = await this.load(this.keyOf(bound));
-      const next = rebuilt ? await buildProjectIndex(collected, { checkoutId: state.checkoutId, appliedRevision: revision }, this.cwd) : stored!;
+      const collected: CollectedSources | undefined = rebuilt ? await (await this.sources()).collectAll() : undefined;
+      const next = collected ? await buildProjectIndex(collected, { checkoutId: state.checkoutId, appliedRevision: revision }, this.cwd) : stored!;
       if (rebuilt) await this.writeIndex(this.keyOf(state), next, signal);
+      const after = collected ? this.currentOf(collected.hashes, collected.manifestHash) : current;
       const components = required.map(id => ({ id, appliedRevision: next.appliedRevision, appliedConfigRevision: INDEX_CONFIG_REVISION, lastAttempt: 'succeeded' as const }));
-      await this.save({ ...state, claims: state.claims.map(claim => claim.standing === 'supported' && claim.supports.some(support => this.staleSupport(support, next, collected)) ? { ...claim, standing: 'needs_review' as const, nextAction: 'Sources changed; inspect before reconfirming.' } : claim),
+      await this.save({ ...state, claims: state.claims.map(claim => claim.standing === 'supported' && claim.supports.some(support => this.staleSupport(support, after)) ? { ...claim, standing: 'needs_review' as const, nextAction: 'Sources changed; inspect before reconfirming.' } : claim),
         refresh: { revision: next.appliedRevision, configRevision: INDEX_CONFIG_REVISION, components } }, state.revision, String(params.operationId), signal);
       return jsonResult(result);
     }
