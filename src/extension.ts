@@ -79,13 +79,20 @@ export default function prjctExtension(pi: ExtensionAPI) {
     const [head = '', ...rest] = sub.split(/\s+/);
     const owner = runtime(ctx.cwd, ctx.sessionManager?.getSessionId() ?? attempt);
     const usage = 'Usage: /prjct (or /p) | init | sync | status | run <service> | analyze | export <path> | work [title] | ship. init connects the project and queues the index, stack and history services; analyze runs the purpose and patterns services in a child Pi; export writes the briefs as one portable markdown file.';
+    const report = (text: string, type: 'info' | 'warning' | 'error') => {
+      // Pi's UI is intentionally a no-op in print/JSON modes. Keep command
+      // feedback visible on stderr without corrupting JSON/stdout consumers.
+      if (ctx.mode === 'print' || ctx.mode === 'json') console.error(text);
+      else ctx.ui.notify(text, type);
+    };
     if (head === 'init' || head === 'sync') {
       const connected = head === 'init' ? await owner.connectProject(ctx.signal) : undefined;
       const runner = await runnerFor(owner, ctx);
-      if (!runner) { ctx.ui.notify('No bound project. Run /prjct init first.', 'error'); return; }
+      if (!runner) { report('No bound project. Run /prjct init first.', 'error'); return; }
       const queued = await owner.shareWalk(() => head === 'init' ? runner.enqueue([...MECHANICAL_SERVICES], 'init') : runner.enqueueStale('sync'));
       const tail = queued.length ? `Queued: ${queued.join(', ')}. /prjct status follows progress.` : 'All services are current.';
-      ctx.ui.notify(`${connected ? `${connected.text} ` : ''}${tail}`, 'info');
+      const initialization = connected ? `${connected.alreadyBound ? 'Project already initialized.' : 'Project initialized.'} ${connected.text} ` : '';
+      report(`${initialization}${tail}`, 'info');
       runner.start();
       // Headless hosts (print/JSON) have no later turn to observe progress: finish here.
       if (!ctx.hasUI) await runner.idle();

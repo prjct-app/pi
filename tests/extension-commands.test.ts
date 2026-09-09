@@ -59,10 +59,18 @@ test('/prjct init connects and runs services without prompting the model; status
   assert.match(notices.at(-1) ?? '', /No bound project/);
 
   await run('init');
-  assert.match(notices.at(-1) ?? '', /Connected project p_[0-9a-f]+ .*2 indexable files\. Queued: index, stack, history\./);
+  assert.match(notices.at(-1) ?? '', /Project initialized\. Connected project p_[0-9a-f]+ .*2 indexable files\. Queued: index, stack, history\./);
   assert.equal(host.sent.length, 0, 'init must not drive the model');
   assert.equal(host.entries.filter(entry => (entry as { status: string }).status === 'done').length, 3);
   assert.deepEqual((await readdir(cwd)).sort(), ['README.md', 'index.ts']);
+
+  const headlessOutput: string[] = [];
+  const originalConsoleError = console.error;
+  console.error = (...values: unknown[]) => { headlessOutput.push(values.map(String).join(' ')); };
+  const headlessCtx = ctx as typeof ctx & { mode?: string };
+  headlessCtx.mode = 'print';
+  try { await run('init'); } finally { delete headlessCtx.mode; console.error = originalConsoleError; }
+  assert.match(headlessOutput.at(-1) ?? '', /Project already initialized\. Reconnected project p_[0-9a-f]+ .*All services are current\./);
 
   await run('status');
   const status = notices.at(-1) ?? '';
