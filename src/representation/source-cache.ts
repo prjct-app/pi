@@ -177,13 +177,15 @@ export class SourceCache {
    * Hashes and manifest of the checkout. Without a live watcher: within the TTL
    * the previous snapshot is reused, and `fresh` forces a new walk that starts
    * after any in-flight walk. With a live watcher: `fresh` waits for events to
-   * settle, then re-stats only the changed paths.
+   * settle, applies changed paths, then validates known paths so a completed
+   * deletion cannot be hidden by late watcher delivery.
    */
   async snapshot(options: { fresh?: boolean; maxAgeMs?: number } = {}): Promise<SourceSnapshot> {
     if (this.live) {
       if (this.inFlight) await this.inFlight.catch(() => undefined);
       if (options.fresh) await this.settle();
       await this.applyDirty();
+      if (options.fresh && this.live) await this.revalidateKnownEntries();
       if (this.live) return this.assemble('watch');
     }
     if (!options.fresh) {
@@ -353,6 +355,16 @@ export class SourceCache {
       })().finally(() => { this.applying = undefined; });
       await this.applying;
     }
+  }
+
+  private async revalidateKnownEntries(): Promise<void> {
+    // A filesystem operation may resolve before its watcher callback is
+    // delivered, especially when many test workers or tools are active. A
+    // fresh snapshot cannot treat that temporary silence as proof that cached
+    // files still exist. Re-stat known files without walking directories; the
+    // watcher remains responsible for discovering additions.
+    const paths = [...this.entries.keys()];
+    await Promise.all(paths.map(path => this.io.run(() => this.reconcile(path))));
   }
 
   private async reconcile(relativePath: string): Promise<void> {
