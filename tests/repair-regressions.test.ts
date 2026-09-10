@@ -162,7 +162,11 @@ test('native source reads can complete documentation tasks, but cannot bypass un
   await assert.rejects(async()=>f.runtime.execute('prjct_checkpoint',{action:'record',kind:'progress',workId,taskId,methodId:'tdd',stage:'test_authored',summary:'x',nextAction:'x',evidenceIds:[],...await f.mutation()}),{code:'INVALID_STAGE'});
   await f.runtime.recordObservation('user_input: seam confirmed for README review',{toolCallId:'seam_u1',toolName:'user_input',outcome:'succeeded'});
   const seamObs=((await f.record())!.payload as {observations:Array<{id:string}>}).observations.at(-1)!.id;
-  await f.runtime.execute('prjct_checkpoint',{action:'record',kind:'progress',workId,taskId,methodId:'tdd',stage:'seam_confirmed',summary:'Seam confirmed.',nextAction:'Author test.',evidenceIds:[seamObs],...await f.mutation()});
+  let approvalPrompt='';
+  await f.runtime.execute('prjct_checkpoint',{action:'record',kind:'progress',workId,taskId,methodId:'tdd',stage:'seam_confirmed',summary:'Seam confirmed.',nextAction:'Author test.',evidenceIds:[seamObs],...await f.mutation()},{confirm:async message=>{approvalPrompt=message;return true;}});
+  assert.match(approvalPrompt,/"summary":"Seam confirmed\."/);assert.match(approvalPrompt,new RegExp(seamObs));assert.match(approvalPrompt,/Challenge: [a-f0-9]{64}/);
+  const persistedApproval=((await f.record())!.payload as {checkpoints:Array<{data?:{approvalChallenge?:string}}>}).checkpoints.at(-1)!.data?.approvalChallenge;
+  assert.match(persistedApproval??'',/^[a-f0-9]{64}$/);assert.match(approvalPrompt,new RegExp(persistedApproval!));
   await f.runtime.execute('prjct_checkpoint',{action:'record',kind:'progress',workId,taskId,methodId:'tdd',stage:'test_authored',summary:'A test exists but no red/green has been observed.',nextAction:'Observe red before green.',evidenceIds:[],...await f.mutation()});
   await assert.rejects(async()=>f.runtime.execute('prjct_task',{action:'transition',workId,taskId,transition:'complete',assessmentId,...await f.mutation()}),{code:'INCOMPLETE_METHOD'});
 });

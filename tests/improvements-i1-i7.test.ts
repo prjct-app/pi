@@ -100,7 +100,7 @@ test('I-7: ship refuses when assessment evidence predates a source change', asyn
     const workId = (work.details as { scope: { workId: string } }).scope.workId;
     await runtime.execute('prjct_task', { action: 'define', workId, definition, criterionIds: ['c1'], operationId: 'op_d', expectedRevision: await rev(), taskId: 't1', maxBytes: 4096 });
     const { checkoutId } = await ids();
-    await runtime.execute('prjct_task', { action: 'claim', workId, taskId: 't1', checkoutId, access: 'write', operationId: 'op_c', expectedRevision: await rev(), maxBytes: 4096 });
+    await runtime.execute('prjct_task', { action: 'claim', workId, taskId: 't1', checkoutId, access: 'write', operationId: 'op_c', expectedRevision: await rev(), maxBytes: 4096 }, { confirm: async () => true });
     await observeNative(runtime);
     const state = (await readRecord(join(scopeStore(prjctHome, (await ids()).key, 'work'), 'state.json')))!;
     const obsId = (state.payload as { observations: Array<{ id: string }> }).observations[0]!.id;
@@ -109,12 +109,12 @@ test('I-7: ship refuses when assessment evidence predates a source change', asyn
       judgments: [{ criterionId: 'c1', conclusion: 'satisfied', evidenceIds: [obsId], rationale: 'pass' }],
       operationId: 'op_a', expectedRevision: await rev(), maxBytes: 4096,
     });
-    const assessmentId = (assessment.details as { recorded: { reference: { id: string } } }).recorded.reference.id;
-    await runtime.execute('prjct_task', { action: 'transition', workId, taskId: 't1', transition: 'complete', assessmentId,
+    const assessmentRef = (assessment.details as { recorded: { reference: { id: string; revision: number; contentHash: string } } }).recorded.reference;
+    await runtime.execute('prjct_task', { action: 'transition', workId, taskId: 't1', transition: 'complete', assessmentId: assessmentRef.id,
       operationId: 'op_done', expectedRevision: await rev(), maxBytes: 4096 });
     await runtime.execute('prjct_checkpoint', {
       action: 'record', workId, kind: 'work_assessment', specificationRevision: 0, planRevision: 0,
-      taskAssessments: [], judgments: [{ criterionId: 'c1', conclusion: 'satisfied', evidenceIds: [obsId], rationale: 'pass' }],
+      taskAssessments: [assessmentRef], judgments: [{ criterionId: 'c1', conclusion: 'satisfied', evidenceIds: [obsId], rationale: 'pass' }],
       operationId: 'op_wa', expectedRevision: await rev(), maxBytes: 4096,
     });
     assert.match(await runtime.ship(), /completed/);
@@ -132,7 +132,7 @@ test('I-7b: ship refuses after sources change post-assessment', async () => {
     const workId = (work.details as { scope: { workId: string } }).scope.workId;
     await runtime.execute('prjct_task', { action: 'define', workId, definition, criterionIds: ['c1'], operationId: 'op_d', expectedRevision: await rev(), taskId: 't1', maxBytes: 4096 });
     const { checkoutId } = await ids();
-    await runtime.execute('prjct_task', { action: 'claim', workId, taskId: 't1', checkoutId, access: 'write', operationId: 'op_c', expectedRevision: await rev(), maxBytes: 4096 });
+    await runtime.execute('prjct_task', { action: 'claim', workId, taskId: 't1', checkoutId, access: 'write', operationId: 'op_c', expectedRevision: await rev(), maxBytes: 4096 }, { confirm: async () => true });
     await observeNative(runtime);
     const state = (await readRecord(join(scopeStore(prjctHome, (await ids()).key, 'work'), 'state.json')))!;
     const obsId = (state.payload as { observations: Array<{ id: string }> }).observations[0]!.id;
@@ -141,12 +141,12 @@ test('I-7b: ship refuses after sources change post-assessment', async () => {
       judgments: [{ criterionId: 'c1', conclusion: 'satisfied', evidenceIds: [obsId], rationale: 'pass' }],
       operationId: 'op_a', expectedRevision: await rev(), maxBytes: 4096,
     });
+    const assessmentRef = (assessment.details as { recorded: { reference: { id: string; revision: number; contentHash: string } } }).recorded.reference;
     await runtime.execute('prjct_task', { action: 'transition', workId, taskId: 't1', transition: 'complete',
-      assessmentId: (assessment.details as { recorded: { reference: { id: string } } }).recorded.reference.id,
-      operationId: 'op_done', expectedRevision: await rev(), maxBytes: 4096 });
+      assessmentId: assessmentRef.id, operationId: 'op_done', expectedRevision: await rev(), maxBytes: 4096 });
     await runtime.execute('prjct_checkpoint', {
       action: 'record', workId, kind: 'work_assessment', specificationRevision: 0, planRevision: 0,
-      taskAssessments: [], judgments: [{ criterionId: 'c1', conclusion: 'satisfied', evidenceIds: [obsId], rationale: 'pass' }],
+      taskAssessments: [assessmentRef], judgments: [{ criterionId: 'c1', conclusion: 'satisfied', evidenceIds: [obsId], rationale: 'pass' }],
       operationId: 'op_wa', expectedRevision: await rev(), maxBytes: 4096,
     });
     await writeFile(join(checkout, 'src/db.ts'), 'export function queryUsers() { return [9] }\n');

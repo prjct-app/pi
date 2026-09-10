@@ -36,10 +36,10 @@ const setup = async (t: TestContext) => {
   await runtime.execute('prjct_task', { action: 'define', workId, taskId: 'task_pair',
     definition: { id: 'definition_pair', revision: 1, contentHash: 'a'.repeat(64) }, criterionIds: ['paired'], ...await mutation() });
   await runtime.execute('prjct_task', { action: 'claim', workId, taskId: 'task_pair', checkoutId: identity.checkoutId,
-    access: 'write', ...await mutation() });
+    access: 'write', ...await mutation() }, { confirm: async () => true });
   const progress = async (methodId: string, stage: string, evidenceIds: string[] = []) =>
     runtime.execute('prjct_checkpoint', { action: 'record', kind: 'progress', workId, taskId: 'task_pair',
-      methodId, stage, evidenceIds, summary: stage, nextAction: 'Continue verification', ...await mutation() });
+      methodId, stage, evidenceIds, summary: stage, nextAction: 'Continue verification', ...await mutation() }, { confirm: async () => true });
   const run = async (command: string, exitCode: number) => {
     await writeFile(control, String(exitCode));
     const beforeHash = await runtime.sourceSnapshot();
@@ -113,6 +113,16 @@ for (const methodId of ['tdd', 'diagnosing-bugs'] as const) {
   });
 }
 
+test('changing the indexed test substrate between RED and GREEN invalidates the pair', async t => {
+  const fixture = await setup(t);
+  const red = await fixture.run('node verify.cjs', 1);
+  await fixture.prepareGreen('tdd', red);
+  await writeFile(join(fixture.cwd, 'verify.cjs'), 'process.exit(0);\n');
+  await fixture.runtime.syncProject();
+  const green = await fixture.run('node verify.cjs', 0);
+  await assert.rejects(fixture.progress('tdd', 'green_observed', [green]), pairingError);
+});
+
 test('redacted commands with different original values cannot form a verification pair', async t => {
   const fixture = await setup(t);
   const red = await fixture.run('FIXTURE_TOKEN=fixture_red node verify.cjs', 1);
@@ -137,8 +147,8 @@ test('diagnosis can pair matching redacted commands without retaining their orig
 
 test('the pure pairing gate fails closed for legacy, cross-scope, and reused-call observations', () => {
   const row = (id: string, outcome: 'failed' | 'succeeded', extra: Partial<VerificationObservation> = {}): VerificationObservation => ({
-    id, provenance: 'native_observation', workId: 'work_a', taskId: 'task_a', commandIdentity: 'command_a',
-    execution: { toolCallId: `call_${id}`, toolName: 'bash', outcome }, ...extra,
+    id, provenance: 'native_observation', workId: 'work_a', taskId: 'task_a', attemptId: 'attempt_a', sessionId: 'session_a',
+    checkoutId: 'checkout_a', commandIdentity: 'command_a', verificationSubstrate: 'substrate_a', execution: { toolCallId: `call_${id}`, toolName: 'bash', outcome }, ...extra,
   });
   const legacy: VerificationObservation[] = [
     { id: 'red', provenance: 'native_observation', workId: 'work_a', taskId: 'task_a', execution: { toolCallId: 'call_red', toolName: 'bash', outcome: 'failed' } },
@@ -147,6 +157,10 @@ test('the pure pairing gate fails closed for legacy, cross-scope, and reused-cal
   assert.equal(hasVerificationPair(legacy, ['red'], ['green']), false, 'identity-less legacy evidence cannot match redacted display strings');
   const crossScope = [row('red', 'failed'), row('green', 'succeeded', { taskId: 'task_b' })];
   assert.equal(hasVerificationPair(crossScope, ['red'], ['green']), false);
+  const wrongAttempt = [row('red', 'failed'), row('green', 'succeeded', { attemptId: 'attempt_b' })];
+  assert.equal(hasVerificationPair(wrongAttempt, ['red'], ['green']), false);
+  const changedSubstrate = [row('red', 'failed'), row('green', 'succeeded', { verificationSubstrate: 'substrate_b' })];
+  assert.equal(hasVerificationPair(changedSubstrate, ['red'], ['green']), false);
   const sameCall = [row('red', 'failed', { execution: { toolCallId: 'same', toolName: 'bash', outcome: 'failed' } }),
     row('green', 'succeeded', { execution: { toolCallId: 'same', toolName: 'bash', outcome: 'succeeded' } })];
   assert.equal(hasVerificationPair(sameCall, ['red'], ['green']), false);

@@ -228,7 +228,7 @@ test('the test convention is in the brief and in the claim hint', async () => {
     const workId = (work.details as { scope: { workId: string } }).scope.workId;
     await runtime.execute('prjct_task', { action: 'define', workId, definition, criterionIds: ['c1'], operationId: 'op_d', expectedRevision: await rev(), taskId: 't1', maxBytes: 4096 });
     const { checkoutId } = await ids();
-    const claimed = await runtime.execute('prjct_task', { action: 'claim', workId, taskId: 't1', checkoutId, access: 'write', operationId: 'op_c', expectedRevision: await rev(), maxBytes: 4096 });
+    const claimed = await runtime.execute('prjct_task', { action: 'claim', workId, taskId: 't1', checkoutId, access: 'write', operationId: 'op_c', expectedRevision: await rev(), maxBytes: 4096 }, { confirm: async () => true });
     assert.match((claimed.details as { items: Array<{ nextAction: string }> }).items[0]!.nextAction, /verify with node --experimental-strip-types --test/);
   } finally {
     await rm(root, { recursive: true, force: true });

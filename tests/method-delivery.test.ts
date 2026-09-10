@@ -67,9 +67,9 @@ test('method gates are wired through the real tool: review, grilling, diagnosis,
   const taskId = 'task_gate';
   await runtime.execute('prjct_task', { action: 'define', workId, taskId, definition: origin, criterionIds: ['done'], ...await mutation() });
   await runtime.execute('prjct_task', { action: 'claim', workId, taskId, checkoutId: (await runtime.identity()).checkoutId, access: 'read', ...await mutation() });
-  const progress = async (methodId: string, stage: string, evidenceIds: string[] = []) =>
+  const progress = async (methodId: string, stage: string, evidenceIds: string[] = [], approve = false) =>
     runtime.execute('prjct_checkpoint', { action: 'record', kind: 'progress', workId, taskId, methodId, stage,
-      summary: 'stage', evidenceIds, nextAction: 'next', ...await mutation() });
+      summary: 'stage', evidenceIds, nextAction: 'next', ...await mutation() }, { confirm: async () => approve });
 
   // code-review walks scope_pinned → standards_pass → spec_pass → reported; 'complete' is not a stage.
   await assert.rejects(() => progress('code-review', 'complete'), { code: 'INVALID_STAGE' });
@@ -78,15 +78,16 @@ test('method gates are wired through the real tool: review, grilling, diagnosis,
   await progress('code-review', 'spec_pass');
   await progress('code-review', 'reported');
 
-  // grilling needs the ordered frontier and a real user-input observation, not a read.
+  // Grilling keeps conversational evidence, but only an exact one-shot host
+  // confirmation authorizes the decision transition.
   await runtime.recordObservation('read something', { toolCallId: 'r1', toolName: 'read', outcome: 'succeeded' });
   const readObs = (await state()).observations.at(-1)!.id;
   await assert.rejects(() => progress('grilling', 'decision_recorded', [readObs]), { code: 'INVALID_STAGE' }); // round_asked first
   await progress('grilling', 'round_asked');
-  await assert.rejects(() => progress('grilling', 'decision_recorded', [readObs]), { code: 'UNVERIFIABLE_EVIDENCE' });
+  await assert.rejects(() => progress('grilling', 'decision_recorded', [readObs]), { code: 'CONFIRMATION_REQUIRED' });
   await runtime.recordObservation('user_input: yes, use option B', { toolCallId: 'u1', toolName: 'user_input', outcome: 'succeeded' });
   const userObs = (await state()).observations.at(-1)!.id;
-  await progress('grilling', 'decision_recorded', [userObs]);
+  await progress('grilling', 'decision_recorded', [userObs], true);
 
   // diagnosis: ordered loop stages; fixed requires reproduced failure then a succeeding command.
   await progress('diagnosing-bugs', 'loop_built');

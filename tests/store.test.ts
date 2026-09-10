@@ -15,8 +15,23 @@ test('reading a missing store record does not create directories or files', asyn
   }
 });
 
-import { writeFile } from 'node:fs/promises';
-import { publishRecord } from '../src/workspace/store.ts';
+import { utimes, writeFile } from 'node:fs/promises';
+import { publishImmutableFile, publishRecord } from '../src/workspace/store.ts';
+
+test('an orphaned immutable body is reusable only when retry content is identical', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'prjct-immutable-'));
+  try {
+    const path = join(root, 'body.md');
+    await publishImmutableFile(path, 'exact body');
+    await publishImmutableFile(path, 'exact body');
+    await assert.rejects(publishImmutableFile(path, 'different body'), (error: unknown) => {
+      assert.equal((error as { code?: string }).code, 'IMMUTABLE_CONFLICT');
+      return true;
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test('a leftover temporary file is not treated as the published record', async () => {
   const root = await mkdtemp(join(tmpdir(), 'prjct-tmp-'));
@@ -98,6 +113,24 @@ test('two processes cannot both commit the first revision of the same record', a
   }
 });
 
+test('two stale-lock recoverers cannot remove a newly acquired lock', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'prjct-recovery-race-'));
+  try {
+    const path = join(root, 'state.json');
+    const lock = `${path}.lock`;
+    await writeFile(lock, JSON.stringify({ pid: 999_999_999, createdAt: 0 }));
+    const old = new Date(Date.now() - 60_000);
+    await utimes(lock, old, old);
+    const [first, second] = await Promise.all([worker(path, 'a'), worker(path, 'b')]);
+    const outcomes = [first, second].map(item => JSON.parse(item.stdout) as { ok: boolean; code?: string });
+    assert.equal(outcomes.filter(item => item.ok).length, 1);
+    assert.equal(outcomes.filter(item => item.code === 'STALE_REVISION' || item.code === 'STORE_LOCKED').length, 1);
+    assert.equal((await readRecord(path))?.revision, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('an unknown record schema is not loaded as current state', async () => {
   const root = await mkdtemp(join(tmpdir(), 'prjct-schema-'));
   try {
@@ -123,6 +156,22 @@ test('publishing a document keeps prior revisions instead of overwriting history
     assert.deepEqual(current?.payload, { v: 2 });
     assert.equal(current?.revision, 2);
     assert.notEqual(first?.contentHash, second?.contentHash);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a stale lock from a dead process is recovered without weakening revision checks', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'prjct-stale-lock-'));
+  try {
+    const path = join(root, 'state.json');
+    const lock = `${path}.lock`;
+    await writeFile(lock, JSON.stringify({ pid: 999_999_999, createdAt: 0 }));
+    const old = new Date(Date.now() - 60_000);
+    await utimes(lock, old, old);
+    const published = await publishRecord(path, { expectedRevision: 0, payload: { recovered: true } });
+    assert.equal(published.revision, 1);
+    assert.deepEqual((await readRecord(path))?.payload, { recovered: true });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
