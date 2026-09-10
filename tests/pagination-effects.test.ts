@@ -143,6 +143,53 @@ test('lookup without work answers the project profile instead of abstaining', as
   }
 });
 
+test('topic lookup returns only requested project context within a compact budget', async () => {
+  const { root, checkout, runtime, ids, prjctHome } = await setup();
+  try {
+    await writeFile(join(checkout, 'package.json'), JSON.stringify({ name: 'demo', scripts: { test: 'node --test' }, dependencies: { typebox: '1.3.7' } }));
+    await runtime.initProject();
+    await runtime.syncProject();
+    await runtime.writeContextDoc('purpose', `# Purpose\n\n${'Relevant purpose detail. '.repeat(145)}\n`, {});
+    for (let index = 0; index < 5; index += 1) {
+      await runtime.recordObservation(`user_input: unrelated retained instruction ${index}`, {
+        toolCallId: `user_${index}`, toolName: 'user_input', outcome: 'succeeded',
+      });
+    }
+
+    const proposed = await runtime.execute('prjct_knowledge', {
+      action: 'propose', projectId: (await runtime.identity()).projectId, operationId: 'op_context_claim',
+      statement: 'An unrelated architecture claim must not leak into a stack and purpose lookup.',
+      supports: [], gaps: [], maxBytes: 4096,
+    });
+    const claimId = (proposed.details as { items: Array<{ reference: { id: string } }> }).items[0]!.reference.id;
+    const { key } = await ids();
+    const statePath = join(scopeStore(prjctHome, key, 'work'), 'state.json');
+    const state = (await readRecord(statePath))!;
+    const observationId = (state.payload as { observations: Array<{ id: string }> }).observations[0]!.id;
+    await runtime.execute('prjct_knowledge', {
+      action: 'resolve', projectId: (await runtime.identity()).projectId, claimId, resolution: 'confirm',
+      rationale: 'Fixture setup.', evidenceIds: [observationId], operationId: 'op_context_resolve',
+      expectedRevision: state.revision, maxBytes: 4096,
+    });
+    await runtime.execute('prjct_work', {
+      action: 'create', projectId: (await runtime.identity()).projectId, operationId: 'op_context_work',
+      title: 'Unrelated selected work', origin, maxBytes: 4096,
+    });
+
+    const result = await runtime.execute('prjct_context', { action: 'lookup', query: 'stack purpose', maxBytes: 24_000 });
+    const details = result.details as { status: string; items: Array<{ kind: string; summary: string }>; gaps: string[] };
+    assert.deepEqual(details.items.map(item => item.kind), ['stack', 'purpose']);
+    assert.equal(details.status, 'partial');
+    assert.ok(details.gaps.some(gap => /compacted/.test(gap)));
+    assert.equal(JSON.stringify(details).includes('observation '), false);
+    assert.equal(JSON.stringify(details).includes('unrelated architecture claim'), false);
+    assert.equal(JSON.stringify(details).includes('Unrelated selected work'), false);
+    assert.ok(Buffer.byteLength(JSON.stringify(details), 'utf8') <= 4096);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('a documentation-only project is understood through CONTEXT.md, ADRs and headings', async () => {
   const { root, checkout, runtime, ids } = await setup();
   try {
