@@ -59,6 +59,60 @@ export const readRevision = async (path: string, revision: number): Promise<Stor
 export type Durability = 'full' | 'light';
 export type PublishRequest = Readonly<{ expectedRevision: number; payload: unknown; signal?: AbortSignal; durability?: Durability }>;
 
+const STORE_LOCK_STALE_MS = 30_000;
+const processAlive = (pid: number): boolean => {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (error) {
+    // Lack of permission proves a process exists; only ESRCH proves it does not.
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+};
+
+const acquireStoreLock = async (path: string) => {
+  const lockPath = `${path}.lock`;
+  const recoveryPath = `${lockPath}.recovery`;
+  let recovery;
+  try {
+    recovery = await open(recoveryPath, 'wx');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') fail('STORE_LOCKED', 'Another writer is acquiring or recovering this record.');
+    throw error;
+  }
+  try {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const handle = await open(lockPath, 'wx');
+        try {
+          await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: Date.now() }), 'utf8');
+          await handle.sync();
+          return handle;
+        } catch (error) {
+          await handle.close().catch(() => undefined);
+          await unlink(lockPath).catch(() => undefined);
+          throw error;
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        const before = await stat(lockPath).catch(() => undefined);
+        const raw = await readFile(lockPath, 'utf8').catch(() => '');
+        let pid = 0;
+        try { pid = Number((JSON.parse(raw) as { pid?: unknown }).pid ?? 0); } catch { /* Legacy/partial lock. */ }
+        const stale = Boolean(before && Date.now() - before.mtimeMs >= STORE_LOCK_STALE_MS && !processAlive(pid));
+        if (!stale) fail('STORE_LOCKED', 'Another writer holds this record.');
+        // Every cooperating acquirer holds the recovery lock, so the pathname
+        // cannot be replaced between this inode check and removal.
+        const after = await stat(lockPath).catch(() => undefined);
+        if (!before || !after || before.ino !== after.ino) fail('STORE_LOCKED', 'The store lock changed during recovery.');
+        await unlink(lockPath);
+      }
+    }
+    return fail('STORE_LOCKED', 'Another writer holds this record.');
+  } finally {
+    await recovery.close();
+    await unlink(recoveryPath).catch(() => undefined);
+  }
+};
+
 const syncDirectory = async (path: string): Promise<void> => {
   // Directory fsync is supported on POSIX; Windows does not expose it here.
   if (process.platform === 'win32') return;
@@ -94,17 +148,35 @@ const linkAtomic = async (source: string, path: string, signal?: AbortSignal, du
   if (durability === 'full') await syncDirectory(path);
 };
 
+// A retry may encounter a fully written immutable body whose metadata was not
+// published before a crash. Identical bytes are safe to reuse; any difference
+// is retained for explicit recovery rather than overwritten.
+export const publishImmutableFile = async (path: string, content: string, signal?: AbortSignal): Promise<void> => {
+  signal?.throwIfAborted();
+  await mkdir(dirname(path), { recursive: true });
+  let file;
+  try {
+    file = await open(path, 'wx');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    if (await readFile(path, 'utf8').catch(() => undefined) !== content) {
+      fail('IMMUTABLE_CONFLICT', 'An interrupted immutable publication has different content; explicit recovery is required.');
+    }
+    return;
+  }
+  try {
+    await file.writeFile(content, 'utf8');
+    await file.sync();
+  } finally { await file.close(); }
+  signal?.throwIfAborted();
+  await syncDirectory(path);
+};
+
 export const publishRecord = async (path: string, request: PublishRequest): Promise<StoreRecord> => {
   request.signal?.throwIfAborted();
   const durability = request.durability ?? 'full';
   await mkdir(dirname(path), { recursive: true });
-  let lock;
-  try {
-    lock = await open(`${path}.lock`, 'wx');
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') fail('STORE_LOCKED', 'Another writer holds this record.');
-    throw error;
-  }
+  const lock = await acquireStoreLock(path);
   try {
     const current = await readRecord(path);
     const revision = current?.revision ?? 0;

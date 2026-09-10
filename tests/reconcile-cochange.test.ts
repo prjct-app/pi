@@ -44,7 +44,7 @@ test('continue takes over a named predecessor with recorded observations; the ol
   try {
     await one.execute('prjct_task', { action: 'define', workId, definition, criterionIds: ['crit_a'], operationId: 'op_t', expectedRevision: await rev(), taskId: 'task_a', maxBytes: 4096 });
     const { checkoutId } = await ids();
-    await one.execute('prjct_task', { action: 'claim', workId, taskId: 'task_a', checkoutId, access: 'write', operationId: 'op_c', expectedRevision: await rev(), maxBytes: 4096 });
+    await one.execute('prjct_task', { action: 'claim', workId, taskId: 'task_a', checkoutId, access: 'write', operationId: 'op_c', expectedRevision: await rev(), maxBytes: 4096 }, { confirm: async () => true });
     await one.recordObservation('bash completed: build ok');
 
     const inspection = await two.execute('prjct_reconcile', { action: 'inspect', workId, taskId: 'task_a', maxBytes: 4096 });

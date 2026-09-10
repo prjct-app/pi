@@ -1,7 +1,7 @@
 import { homedir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { isToolCallEventType, withFileMutationQueue, type ExtensionAPI, type ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { AGENT_OUTPUT_INSTRUCTION } from './agent-output.ts';
 import { ProcessRuntime, type HostExecution } from './pi/process-runtime.ts';
 import { createProcessTools, processToolNames } from './pi/register-tools.ts';
@@ -10,6 +10,9 @@ import { redactSecrets } from './knowledge/redact.ts';
 import { digestToolResult } from './knowledge/digest.ts';
 import { JobRunner, formatJobs, type RunnerEvent } from './jobs/runner.ts';
 import { MECHANICAL_SERVICES, MODEL_SERVICES, SERVICE_ORDER, createServices } from './jobs/services.ts';
+import { canonicalMutationPath } from './work/native-mutation-policy.ts';
+import { LifecycleContinuity } from './work/lifecycle-continuity.ts';
+import type { BindingPointer } from './work/session-binding.ts';
 
 const agentHome = (): string => process.env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi', 'agent');
 // This file is the extension entry; child Pi processes load it explicitly.
@@ -34,6 +37,8 @@ const SUBCOMMANDS = ['init', 'sync', 'status', 'run', 'analyze', 'export', 'work
 // load. Durable process state lives in the global prjct home, never the client checkout.
 export default function prjctExtension(pi: ExtensionAPI) {
   let attempt = newId('attempt');
+  const continuity = new LifecycleContinuity();
+  let lastPointer = '';
   const runtimes = new Map<string, ProcessRuntime>();
   // The runner persists per project, but its model selection follows the
   // current session. Services snapshot it only when each model job starts.
@@ -123,6 +128,24 @@ export default function prjctExtension(pi: ExtensionAPI) {
     runners.clear();
   };
 
+  const restorePointer = async (ctx: Pick<ExtensionContext, 'cwd' | 'sessionManager'>): Promise<void> => {
+    const branchId = ctx.sessionManager.getSessionId();
+    const entry = [...ctx.sessionManager.getBranch()].reverse().find(row => row.type === 'custom' && row.customType === 'prjct_binding');
+    const pointer = entry?.type === 'custom' ? entry.data as BindingPointer | undefined : undefined;
+    if (!pointer) return;
+    await runtime(ctx.cwd, branchId).restoreSessionPointer(branchId, pointer).catch(() => undefined);
+  };
+  const persistPointer = async (ctx: Pick<ExtensionContext, 'cwd' | 'sessionManager'>): Promise<void> => {
+    const branchId = ctx.sessionManager.getSessionId();
+    const pointer = await runtime(ctx.cwd, branchId).sessionPointer(branchId).catch(() => undefined);
+    if (!pointer) return;
+    const serialized = JSON.stringify(pointer);
+    if (serialized === lastPointer) return;
+    lastPointer = serialized;
+    // Custom entries are durable branch pointers and never enter model context.
+    pi.appendEntry('prjct_binding', pointer);
+  };
+
   const commandHandler = async (args: string, ctx: Parameters<Parameters<typeof pi.registerCommand>[1]['handler']>[1]) => {
     const sub = (args ?? '').trim();
     const [head = '', ...rest] = sub.split(/\s+/);
@@ -180,11 +203,16 @@ export default function prjctExtension(pi: ExtensionAPI) {
       const exported = await owner.exportBriefs();
       if (!exported) { respond(ctx, 'No bound project. Run /prjct init first.', 'error'); return; }
       if (!exported.included.length) { respond(ctx, 'Nothing to export yet: run /prjct init (stack, history) and /prjct analyze (purpose, patterns) first.', 'error'); return; }
-      const destination = resolve(ctx.cwd, target);
+      let destination: string;
+      try { destination = await canonicalMutationPath(ctx.cwd, target); }
+      catch (error) { respond(ctx, `Export refused: ${(error as Error).message}`, 'error'); return; }
       const { writeFile, stat } = await import('node:fs/promises');
       const exists = await stat(destination).then(() => true, () => false);
       if (exists && !rest.includes('--force')) { respond(ctx, `${destination} exists; add --force to overwrite.`, 'error'); return; }
-      await writeFile(destination, exported.text, 'utf8');
+      if (!ctx.hasUI || headless(ctx) || !await ctx.ui.confirm('Authorize prjct export', `Write ${Buffer.byteLength(exported.text, 'utf8')} bytes to ${destination}?`)) {
+        respond(ctx, 'Export refused: current host confirmation is required and headless execution fails closed.', 'error'); return;
+      }
+      await withFileMutationQueue(destination, () => writeFile(destination, exported.text, 'utf8'));
       respond(ctx, `Exported ${exported.included.join(', ')} to ${destination} (${Buffer.byteLength(exported.text, 'utf8')} bytes).`, 'info');
       return;
     }
@@ -216,9 +244,11 @@ export default function prjctExtension(pi: ExtensionAPI) {
     handler: commandHandler,
   });
 
-  pi.on('session_start', async (_event, ctx) => {
+  pi.on('session_start', async (event, ctx) => {
     await stopRunners();
     attempt = newId('attempt');
+    lastPointer = '';
+    continuity.mark(event.reason);
     runtimes.clear(); executions.clear();
     const active = pi.getActiveTools();
     const prjctActive = active.filter(name => processToolNames.includes(name));
@@ -227,11 +257,10 @@ export default function prjctExtension(pi: ExtensionAPI) {
     const next = allOn ? [...others, 'prjct_context'] : [...others, ...prjctActive];
     if (!next.includes('prjct_context')) next.push('prjct_context');
     pi.setActiveTools(next);
-    // Resume work a previous session left queued or interrupted; never start new work here.
     if (isChildJob()) return;
     try {
-      const owner = runtime(ctx.cwd, ctx.sessionManager?.getSessionId() ?? attempt);
-      // Live source watcher: hooks and lookups re-stat only what changed.
+      await restorePointer(ctx);
+      const owner = runtime(ctx.cwd, ctx.sessionManager.getSessionId());
       await owner.watchSources().catch(() => false);
       const runner = await runnerFor(owner, ctx);
       if (!runner) return;
@@ -241,8 +270,18 @@ export default function prjctExtension(pi: ExtensionAPI) {
     } catch { /* Unbound or unreadable project: nothing to resume. */ }
   });
 
-  // Real user input is native evidence for human-in-the-loop methods (grilling
-  // decisions, takeover consent). Commands and extension-injected messages are not.
+  pi.on('before_agent_start', async (_event, ctx) => {
+    if (isChildJob() || !continuity.isPending()) return;
+    const owner = runtime(ctx.cwd, ctx.sessionManager.getSessionId());
+    const summary = await owner.lifecycleSummary().catch(() => undefined);
+    if (!summary) { continuity.consume(''); return; }
+    const content = continuity.consume(summary);
+    if (!content) return;
+    return { message: { customType: 'prjct_reanchor', content, display: false } };
+  });
+
+  // Input is retained as conversation evidence only. Authority-sensitive state
+  // changes use an exact, one-shot host confirmation inside their operation.
   pi.on('input', async (event, ctx) => {
     if (event.source !== 'interactive') return { action: 'continue' as const };
     const text = event.text.trim();
@@ -250,32 +289,73 @@ export default function prjctExtension(pi: ExtensionAPI) {
     const owner = runtime(ctx.cwd, ctx.sessionManager.getSessionId());
     try {
       await owner.recordObservation(`user_input: ${redactSecrets(text.slice(0, 1800))}`, {
-        toolCallId: `input_${Date.now()}`, toolName: 'user_input', outcome: 'succeeded',
+        toolCallId: `input_${Date.now()}`, toolName: 'user_input', outcome: 'succeeded', coverage: 'exact',
       });
     } catch { /* Uninitialized projects do not record. */ }
     return { action: 'continue' as const };
   });
-  // While the agent is idle a full walk is free: it corrects anything the watcher missed.
-  pi.on('agent_settled', (_event, ctx) => {
+
+  pi.on('session_before_compact', async (_event, ctx) => {
+    try { await runtime(ctx.cwd, ctx.sessionManager.getSessionId()).suspendAttempt(); }
+    catch (error) {
+      ctx.ui.notify(`prjct blocked compaction: ${error instanceof Error ? error.message : String(error)}`, 'error');
+      return { cancel: true };
+    }
+  });
+  pi.on('session_compact', () => { continuity.mark('compact'); lastPointer = ''; });
+  pi.on('session_before_tree', async (_event, ctx) => {
+    try { await runtime(ctx.cwd, ctx.sessionManager.getSessionId()).suspendAttempt(); }
+    catch (error) {
+      ctx.ui.notify(`prjct blocked tree navigation: ${error instanceof Error ? error.message : String(error)}`, 'error');
+      return { cancel: true };
+    }
+  });
+  pi.on('session_tree', async (_event, ctx) => {
+    continuity.mark('tree'); lastPointer = '';
+    await restorePointer(ctx);
+  });
+
+  // While the agent is idle, persist one branch-local context pointer and use a
+  // full walk to correct anything the watcher missed.
+  pi.on('agent_settled', async (_event, ctx) => {
     if (isChildJob()) return;
-    const owner = runtimes.get(`${ctx.sessionManager?.getSessionId() ?? attempt}:${ctx.cwd}`);
-    void owner?.revalidateSources().catch(() => undefined);
+    await persistPointer(ctx);
+    const owner = runtimes.get(`${ctx.sessionManager.getSessionId()}:${ctx.cwd}`);
+    await owner?.revalidateSources().catch(() => undefined);
   });
   pi.on('session_shutdown', async () => {
+    await Promise.allSettled([...runtimes.values()].map(owner => owner.suspendAttempt()));
     for (const owner of runtimes.values()) owner.unwatchSources();
     await stopRunners();
     await Promise.allSettled([...runtimes.values()].map(owner => owner.flush()));
     runtimes.clear(); executions.clear();
   });
-  // Capture native input and the pre-execution source snapshot. Pi still owns all execution.
+
+  // Only Pi-mediated edit/write calls are intercepted. This is an authority
+  // gate, not an OS sandbox; external processes and shell side effects remain
+  // outside its control.
+  pi.on('tool_call', async (event, ctx) => {
+    if (!isToolCallEventType('edit', event) && !isToolCallEventType('write', event)) return;
+    const owner = runtime(ctx.cwd, ctx.sessionManager.getSessionId());
+    try {
+      const decision = await owner.nativeMutationDecision(event.input.path);
+      if (!decision.allowed) return { block: true, terminate: true, reason: `${decision.code}: ${decision.reason}` };
+    } catch (error) {
+      return { block: true, terminate: true, reason: `${(error as { code?: string }).code ?? 'MUTATION_DENIED'}: ${(error as Error).message}` };
+    }
+  });
+
+  // Capture native input and a pre-execution source manifest. Bash coverage is
+  // explicitly partial because the source cache is not a filesystem sandbox.
   pi.on('tool_execution_start', async (event, ctx) => {
-    if (!['bash', 'read'].includes(event.toolName)) return;
+    if (!['bash', 'read', 'edit', 'write'].includes(event.toolName)) return;
     const owner = runtime(ctx.cwd, ctx.sessionManager.getSessionId());
     const args = event.args as { command?: string; path?: string };
     const captured: HostExecution = { toolCallId: event.toolCallId, toolName: event.toolName, outcome: 'unknown',
+      coverage: event.toolName === 'bash' ? 'partial' : 'exact',
       ...(args.command ? { command: args.command } : {}),
       ...(args.path ? { sourcePaths: [relative(ctx.cwd, resolve(ctx.cwd, args.path)).replaceAll('\\', '/')] } : {}) };
-    try { captured.beforeHash = await owner.sourceSnapshot(); } catch { /* End capture stays unknown. */ }
+    try { captured.beforeHash = (await owner.sourceStamp()).manifestHash; } catch { captured.coverage = 'unknown'; }
     executions.set(event.toolCallId, { owner, captured });
   });
   pi.on('tool_execution_end', async (event, ctx) => {
@@ -283,12 +363,16 @@ export default function prjctExtension(pi: ExtensionAPI) {
     if (!entry) return;
     executions.delete(event.toolCallId);
     try {
-      // Digest, never echo: the agent already holds the tool output; evidence needs its shape.
       const digest = digestToolResult(event.toolName, event.result as Parameters<typeof digestToolResult>[1],
         { ...(entry.captured.sourcePaths?.[0] ? { path: entry.captured.sourcePaths[0] } : {}), ...(entry.captured.command ? { command: entry.captured.command } : {}) });
       const text = redactSecrets(digest.text);
+      let outcome: HostExecution['outcome'] = ctx.signal?.aborted || !entry.captured.beforeHash ? 'unknown' : event.isError ? 'failed' : 'succeeded';
+      if (outcome === 'succeeded' && ['edit', 'write'].includes(event.toolName) && entry.captured.sourcePaths?.[0]) {
+        const standing = await entry.owner.nativeMutationDecision(entry.captured.sourcePaths[0]);
+        if (!standing.allowed) outcome = 'unknown';
+      }
       await entry.owner.recordObservation(`${event.toolName} ${event.isError ? 'failed' : 'completed'}: ${text}`, {
-        ...entry.captured, outcome: ctx.signal?.aborted || !entry.captured.beforeHash ? 'unknown' : event.isError ? 'failed' : 'succeeded',
+        ...entry.captured, outcome,
       });
     } catch (error) {
       if (ctx.hasUI) ctx.ui.notify(`prjct could not retain evidence: ${(error as Error).message}`, 'warning');

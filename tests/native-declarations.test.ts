@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { validateToolArguments } from '@earendil-works/pi-ai';
 import { processToolDeclarations } from '../src/pi/tool-declarations.ts';
+import { createProcessTools } from '../src/pi/register-tools.ts';
 
 const reference = { id: 'artifact_a', revision: 2, contentHash: 'a'.repeat(64) };
 const mutation = { operationId: 'operation_a', expectedRevision: 2, maxBytes: 2048 };
@@ -50,6 +51,10 @@ const cases: Array<[string, Record<string, unknown>]> = [
   ['prjct_artifact', { action: 'prepare_export', projectId: 'project_a', operationId: 'operation_a', revision: reference,
     targetDescription: 'Existing issue discussion, subject to current user authorization.', maxBytes: 2048 }],
 ];
+
+test('process tools serialize against sibling native calls in one assistant batch', () => {
+  assert.ok(createProcessTools(() => '/tmp').every(tool => tool.executionMode === 'sequential'));
+});
 
 for (const [name, input] of cases) {
   test(`${name} accepts its ${input.action ?? 'query'} contract example through native Pi validation`, () => {

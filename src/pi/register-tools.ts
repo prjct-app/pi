@@ -7,6 +7,9 @@ export const processToolNames = processToolDeclarations.map(item => item.name);
 export const createProcessTools = (home: () => string, activate?: (names: string[]) => void, attemptId?: () => string, runtimeFor?: (cwd: string, sessionId: string) => ProcessRuntime) =>
   processToolDeclarations.map(declaration => defineTool({
     ...declaration,
+    // Process mutations and native file calls must not race as sibling tools in
+    // one assistant batch. Cross-process races still rely on durable CAS.
+    executionMode: 'sequential',
     execute: async (_id, params, signal, _update, ctx) => {
       const sessionId = ctx.sessionManager.getSessionId();
       const runtime = runtimeFor?.(ctx.cwd, sessionId) ?? new ProcessRuntime({ agentHome: home(), cwd: ctx.cwd, sessionId,

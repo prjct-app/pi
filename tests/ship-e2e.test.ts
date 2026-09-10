@@ -51,7 +51,7 @@ test('ship end-to-end: red-green-verified work closes; unverified work is refuse
 
   // Task, claimed for write.
   await runtime.execute('prjct_task', { action: 'define', workId, taskId: 'task_fix', definition: srcRef, criterionIds: ['boundary_correct'], ...await mutation() });
-  await runtime.execute('prjct_task', { action: 'claim', workId, taskId: 'task_fix', checkoutId: id.checkoutId, access: 'write', ...await mutation() });
+  await runtime.execute('prjct_task', { action: 'claim', workId, taskId: 'task_fix', checkoutId: id.checkoutId, access: 'write', ...await mutation() }, { confirm: async () => true });
 
   // TDD: seam confirmed by user, failing test authored and observed red.
   const seamObs = await bash('true', 'noop'); // placeholder replaced by user evidence below
@@ -60,7 +60,7 @@ test('ship end-to-end: red-green-verified work closes; unverified work is refuse
   const userObs = (await stateDoc()).observations.at(-1)!.id;
   const progress = async (stage: string, evidenceIds: string[]) =>
     runtime.execute('prjct_checkpoint', { action: 'record', kind: 'progress', workId, taskId: 'task_fix', methodId: 'tdd', stage,
-      summary: stage, evidenceIds, nextAction: 'next', ...await mutation() });
+      summary: stage, evidenceIds, nextAction: 'next', ...await mutation() }, { confirm });
   await progress('seam_confirmed', [userObs]);
 
   await writeFile(join(cwd, 'check.test.mjs'), "import test from 'node:test'; import assert from 'node:assert/strict'; import { reserveSeat } from './src.js';\ntest('89 minutes rejected', () => assert.equal(reserveSeat(89), false));\n");
@@ -87,11 +87,11 @@ test('ship end-to-end: red-green-verified work closes; unverified work is refuse
   const assessment = await runtime.execute('prjct_checkpoint', { action: 'record', kind: 'assessment', workId, taskId: 'task_fix',
     planRevision: 0, definitionRevision: 1,
     judgments: [{ criterionId: 'boundary_correct', conclusion: 'satisfied', evidenceIds: [greenObs], rationale: 'green at boundary' }], ...await mutation() });
-  const assessmentId = (assessment.details as { recorded: { reference: { id: string } } }).recorded.reference.id;
-  await runtime.execute('prjct_task', { action: 'transition', workId, taskId: 'task_fix', transition: 'complete', assessmentId, ...await mutation() });
+  const assessmentRef = (assessment.details as { recorded: { reference: { id: string; revision: number; contentHash: string } } }).recorded.reference;
+  await runtime.execute('prjct_task', { action: 'transition', workId, taskId: 'task_fix', transition: 'complete', assessmentId: assessmentRef.id, ...await mutation() });
 
   const workAssessment = await runtime.execute('prjct_checkpoint', { action: 'record', kind: 'work_assessment', workId,
-    specificationRevision: 1, planRevision: 0, taskAssessments: [],
+    specificationRevision: 1, planRevision: 0, taskAssessments: [assessmentRef],
     judgments: [{ criterionId: 'boundary_correct', conclusion: 'satisfied', evidenceIds: [greenObs], rationale: 'verified' }], ...await mutation() });
   void workAssessment;
   const shipText = await runtime.ship();

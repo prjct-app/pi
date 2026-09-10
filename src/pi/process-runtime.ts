@@ -1,12 +1,12 @@
 import { withFileMutationQueue } from '@earendil-works/pi-coding-agent';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { mkdir, writeFile, readFile, realpath } from 'node:fs/promises';
+import { readFile, realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { contentRef, newId, sha256 } from '../workspace/ids.ts';
 import { assertStoreOutsideSource, bindIdentity, projectKey, resolveIdentity, scopeStore, type IdentityResolution } from '../workspace/identity.ts';
 import { checkMutationPreconditions } from '../workspace/mutation-preconditions.ts';
-import { publishRecord, readRecord, readRecordCached, readRevision, type Durability } from '../workspace/store.ts';
+import { publishImmutableFile, publishRecord, readRecord, readRecordCached, readRevision, type Durability } from '../workspace/store.ts';
 import { observeEvidence } from '../knowledge/evidence.ts';
 import { redactSecrets } from '../knowledge/redact.ts';
 import { outlineOf } from '../knowledge/digest.ts';
@@ -28,7 +28,8 @@ import { renderStack } from '../jobs/stack.ts';
 import { assertMethodProgress, METHOD_STAGES } from '../work/method-progress.ts';
 import { assertReuseAssessment } from '../work/checkpoint-contract.ts';
 import { listMethodDocuments, loadMethodDocument, matchMethods, methodCatalog } from '../methods/registry.ts';
-import { reconstructBinding } from '../work/session-binding.ts';
+import { reconstructBinding, type BindingPointer, type ReconstructedBinding } from '../work/session-binding.ts';
+import { authorizeNativeMutation, canonicalMutationPath, type NativeMutationDecision } from '../work/native-mutation-policy.ts';
 import { assessCompletion, type CompletionSnapshot } from '../work/completion.ts';
 import { assertTaskTransition, type TransitionState } from '../work/transition-preconditions.ts';
 import { hasVerificationPair } from '../work/verification-pair.ts';
@@ -54,9 +55,11 @@ type PlanRow = { id: string; workId: string; kind: 'spec' | 'plan'; standing: 'd
   specification: Ref | null; tasks: Array<{ taskId: string; definitionRevision: number }>; criterionIds: string[]; nextAction: string };
 type GrantRow = { attemptId: string; generation: number; standing: 'valid' | 'uncertain' | 'released' | 'revoked' };
 type EdgeRow = { from: string; to: string; relation: string };
-export type HostExecution = { toolCallId: string; toolName: string; command?: string; outcome: 'succeeded' | 'failed' | 'unknown'; beforeHash?: string; sourcePaths?: string[] };
+export type HostExecution = { toolCallId: string; toolName: string; command?: string; outcome: 'succeeded' | 'failed' | 'unknown'; beforeHash?: string;
+  coverage?: 'exact' | 'partial' | 'unknown'; sourcePaths?: string[] };
 type ObservationRow = { id: string; provenance: 'native_observation' | 'agent_report'; summary: string; supports: Ref[];
-  attemptId?: string; workId?: string; taskId?: string; execution?: HostExecution; verification?: boolean; commandIdentity?: string };
+  attemptId?: string; sessionId?: string; checkoutId?: string; workId?: string; taskId?: string; execution?: HostExecution;
+  verification?: boolean; commandIdentity?: string; verificationSubstrate?: string };
 type Document = { projectId: string; checkoutId: string; location: string; day: string; revision: number;
   works: WorkRow[]; tasks: TaskRow[]; claims: ClaimRow[]; artifacts: ArtifactRow[];
   checkpoints: CheckpointRow[]; plans: PlanRow[]; selectedWorkId: string | null; selections?: Record<string, string | null>;
@@ -132,7 +135,9 @@ export class ProcessRuntime {
   private currentCache: { generation: number; current: CurrentSources } | undefined;
   private walkShare = new AsyncLocalStorage<{ snapshot?: Promise<SourceSnapshot> }>();
   private indexCache: { manifestHash: string; index: ProjectIndex } | undefined;
-  private transaction = new AsyncLocalStorage<{ params: Record<string, unknown>; hash: string; pending?: Document; baseRevision?: number; files?: Array<{ path: string; content: string; overwrite?: boolean }>; confirm?: (message: string) => Promise<boolean> }>();
+  private transaction = new AsyncLocalStorage<{ params: Record<string, unknown>; hash: string; pending?: Document; baseRevision?: number;
+    files?: Array<{ path: string; content: string }>; records?: Array<{ path: string; expectedRevision: number; payload: unknown }>;
+    confirm?: (message: string) => Promise<boolean> }>();
   constructor(options: ProcessRuntimeOptions) {
     this.agentHome = options.agentHome;
     this.cwd = options.cwd;
@@ -140,6 +145,12 @@ export class ProcessRuntime {
     this.attemptId = options.attemptId ?? newId('attempt');
     this.sessionId = options.sessionId ?? this.attemptId;
     this.prjctRoot = options.prjctHome ?? process.env.PRJCT_HOME ?? join(homedir(), '.prjct');
+  }
+
+  private approvalRequest(label: string, details: Record<string, unknown>): { challenge: string; prompt: string } {
+    const payload = { label, ...details, attemptId: this.attemptId, sessionId: this.sessionId };
+    const challenge = sha256(JSON.stringify(payload));
+    return { challenge, prompt: `${label}\n${redactSecrets(JSON.stringify(payload))}\nChallenge: ${challenge}` };
   }
 
   async statusText(): Promise<string> {
@@ -150,6 +161,88 @@ export class ProcessRuntime {
     return work
       ? `Selected ${work.id}: ${work.title} (${work.disposition}). Next: ${work.nextAction}`
       : `Bound project ${bound.projectId} has no selected work.`;
+  }
+
+  async sessionPointer(branchId: string): Promise<BindingPointer | undefined> {
+    const bound = await this.peekBinding();
+    if (!bound) return undefined;
+    const state = await this.load(this.keyOf(bound));
+    const work = state.works.find(item => item.id === state.selectedWorkId);
+    if (!work) return undefined;
+    const candidates = state.tasks.filter(task => task.workId === work.id && task.attemptId === this.attemptId
+      && state.grants.tasks[task.id]?.attemptId === this.attemptId);
+    const task = candidates.length === 1 ? candidates[0] : undefined;
+    const taskGrant = task ? state.grants.tasks[task.id] : undefined;
+    const writer = state.grants.writer?.attemptId === this.attemptId ? state.grants.writer : undefined;
+    return { workId: work.id, branchId, checkoutId: bound.checkoutId, attemptId: this.attemptId,
+      ...(task ? { taskId: task.id } : {}), ...(taskGrant ? { taskGeneration: taskGrant.generation } : {}),
+      ...(writer ? { writerGeneration: writer.generation } : {}) };
+  }
+
+  async restoreSessionPointer(branchId: string, pointer: BindingPointer): Promise<ReconstructedBinding | undefined> {
+    const bound = await this.peekBinding();
+    if (!bound) return undefined;
+    const state = await this.load(this.keyOf(bound));
+    if (!state.works.some(work => work.id === pointer.workId) || pointer.checkoutId !== bound.checkoutId) return undefined;
+    this.selection = pointer.workId;
+    const currentGrants = [
+      ...Object.entries(state.grants.tasks).map(([scopeId, grant]) => ({ scopeId, ...grant })),
+      ...(state.grants.writer ? [{ scopeId: state.grants.writer.checkoutId, ...state.grants.writer }] : []),
+    ];
+    return reconstructBinding({ branchId, currentAttemptId: this.attemptId, currentCheckoutId: bound.checkoutId, pointer, currentGrants });
+  }
+
+  async lifecycleSummary(): Promise<string | undefined> {
+    if (!await this.peekBinding()) return undefined;
+    return this.statusText();
+  }
+
+  async nativeMutationDecision(requestedPath: string): Promise<NativeMutationDecision & { path?: string }> {
+    const bound = await this.peekBinding();
+    if (!bound) return { allowed: true, managed: false };
+    const state = await this.load(this.keyOf(bound));
+    const work = state.works.find(item => item.id === state.selectedWorkId);
+    if (!work) return { allowed: true, managed: false };
+    if (work.disposition !== 'open') return { allowed: false, managed: true, code: 'WORK_NOT_OPEN', reason: 'Selected work is not open for mutation.' };
+    const scoped = state.tasks.filter(task => task.workId === work.id && task.attemptId === this.attemptId);
+    const valid = scoped.filter(task => task.grantStanding === 'valid');
+    const candidates = valid.length ? valid : scoped.filter(task => task.grantStanding === 'uncertain');
+    const task = candidates.length === 1 ? candidates[0] : undefined;
+    const taskGrant = task ? state.grants.tasks[task.id] : undefined;
+    const writer = state.grants.writer ?? undefined;
+    const decision = authorizeNativeMutation({ managed: true, checkoutId: state.checkoutId, boundCheckoutId: bound.checkoutId,
+      currentAttemptId: this.attemptId, candidateCount: candidates.length,
+      ...(task ? { taskId: task.id, taskCheckoutId: task.checkoutId, taskAttemptId: task.attemptId,
+        taskAccess: task.access, taskStanding: task.grantStanding } : {}),
+      ...(taskGrant ? { taskGrantAttemptId: taskGrant.attemptId, taskGrantStanding: taskGrant.standing } : {}),
+      ...(writer ? { writerCheckoutId: writer.checkoutId, writerAttemptId: writer.attemptId, writerStanding: writer.standing } : {}) });
+    if (!decision.allowed) return decision;
+    return { ...decision, path: await canonicalMutationPath(bound.location, requestedPath) };
+  }
+
+  async suspendAttempt(): Promise<void> {
+    const bound = await this.peekBinding();
+    if (!bound) return;
+    await withFileMutationQueue(this.statePath(this.keyOf(bound)), async () => {
+      const state = await this.load(this.keyOf(bound));
+      let changed = false;
+      const taskGrants = Object.fromEntries(Object.entries(state.grants.tasks).map(([id, grant]) => {
+        if (grant.attemptId !== this.attemptId || grant.standing !== 'valid') return [id, grant];
+        changed = true;
+        return [id, { ...grant, standing: 'uncertain' as const }];
+      }));
+      let writer = state.grants.writer;
+      if (writer?.attemptId === this.attemptId && writer.standing === 'valid') {
+        changed = true;
+        writer = { ...writer, standing: 'uncertain' as const };
+      }
+      const tasks = state.tasks.map(task => {
+        if (task.attemptId !== this.attemptId || task.grantStanding !== 'valid') return task;
+        changed = true;
+        return { ...task, grantStanding: 'uncertain' as const };
+      });
+      if (changed) await this.save({ ...state, grants: { tasks: taskGrants, writer }, tasks }, state.revision, newId('lifecycle'));
+    });
   }
 
   async execute(name: string, params: Record<string, unknown>, extras: { signal?: AbortSignal; activate?: (names: string[]) => void; confirm?: (message: string) => Promise<boolean> } = {}): Promise<ToolResult> {
@@ -187,10 +280,19 @@ export class ProcessRuntime {
       const frame = this.transaction.getStore()!;
       if (frame.pending) {
         const pending = frame.pending;
+        // Immutable artifact bodies may precede their metadata. If publication
+        // stops, the unreferenced wx-created body is recovery evidence, never a
+        // second canonical state.
         for (const file of frame.files ?? []) {
+          await publishImmutableFile(file.path, file.content, extras.signal);
+        }
+        // Auxiliary records contain only receipts from already-published state.
+        // Publish them through their own CAS before the primary record; a crash
+        // can leave a harmless duplicate archive, never a receipt for this call.
+        for (const record of frame.records ?? []) {
           extras.signal?.throwIfAborted();
-          await mkdir(join(file.path, '..'), { recursive: true });
-          await writeFile(file.path, file.content, file.overwrite ? undefined : { flag: 'wx' });
+          await publishRecord(record.path, { expectedRevision: record.expectedRevision, payload: record.payload,
+            ...(extras.signal ? { signal: extras.signal } : {}) });
         }
         const prior = pending.operations[operationId]!;
         pending.operations[operationId] = { ...prior, requestHash, result };
@@ -205,7 +307,7 @@ export class ProcessRuntime {
     if (name === 'prjct_work') return this.work(params, extras.signal);
     if (name === 'prjct_task') return this.task(params, extras.signal);
     if (name === 'prjct_plan') return this.plan(params, extras.signal);
-    if (name === 'prjct_checkpoint') return this.checkpoint(params, extras.signal);
+    if (name === 'prjct_checkpoint') return this.checkpoint(params, extras.signal, extras.confirm);
     if (name === 'prjct_reconcile') return this.reconcile(params, extras.signal);
     if (name === 'prjct_knowledge') return this.knowledge(params, extras.signal);
     if (name === 'prjct_artifact') return this.artifact(params, extras.signal);
@@ -556,7 +658,7 @@ export class ProcessRuntime {
     return `Understanding: briefs ${briefs.length ? briefs.join(', ') : 'none'}; ${supported} supported claim(s)${pending ? `, ${pending} pending review` : ''}.`;
   }
 
-  private async peekBinding(): Promise<{ projectId: string; checkoutId: string; day: string; initialized?: boolean } | undefined> {
+  private async peekBinding(): Promise<{ location: string; projectId: string; checkoutId: string; day: string; initialized?: boolean } | undefined> {
     // Identity lookup must not fail merely because the current cwd is the store
     // itself; only binding/indexing/writing enforce source/store separation.
     const resolution = await this.resolvedIdentity();
@@ -663,7 +765,7 @@ export class ProcessRuntime {
       const archivePath = join(scopeStore(this.prjctRoot, key, 'work'), 'receipts-archive.json');
       const archive = await readRecord(archivePath);
       const archivedPayload = { receipts: { ...((archive?.payload as { receipts?: Record<string, unknown> } | undefined)?.receipts ?? {}), ...Object.fromEntries(overflow) } };
-      if (frame) (frame.files ??= []).push({ path: archivePath, content: JSON.stringify({ schemaVersion: 1, revision: (archive?.revision ?? 0) + 1, contentHash: sha256(JSON.stringify(archivedPayload)), payload: archivedPayload }), overwrite: true });
+      if (frame) (frame.records ??= []).push({ path: archivePath, expectedRevision: archive?.revision ?? 0, payload: archivedPayload });
       else await publishRecord(archivePath, { expectedRevision: archive?.revision ?? 0, payload: archivedPayload, ...(signal ? { signal } : {}) });
     }
     const nextDoc: Document = { ...document, selections: { ...document.selections, [this.sessionId]: document.selectedWorkId }, revision: expectedRevision + 1,
@@ -1008,8 +1110,11 @@ export class ProcessRuntime {
       return jsonResult(result);
     }
     if (action === 'select') {
-      const saved = await this.save({ ...state, selectedWorkId: work.id, checkoutId: String(params.checkoutId) }, state.revision, String(params.operationId), signal);
-      reconstructBinding({ branchId: 'current', pointer: { workId: work.id }, currentGrants: [] });
+      const checkoutId = String(params.checkoutId);
+      if (checkoutId !== bound.checkoutId || state.checkoutId !== bound.checkoutId) {
+        fail('CHECKOUT_MISMATCH', `This host checkout is ${bound.checkoutId}; selection cannot bind ${checkoutId}.`);
+      }
+      const saved = await this.save({ ...state, selectedWorkId: work.id }, state.revision, String(params.operationId), signal);
       const result = { action: 'select', status: 'ok', scope: { workId: work.id, checkoutId: String(params.checkoutId) }, gaps: [],
         mutation: { operationId: String(params.operationId), scopeId: saved.projectId, outcome: 'committed',
           receipt: saved.operations[String(params.operationId)]!.receipt, replayed: false, stateRevision: saved.revision },
@@ -1074,7 +1179,7 @@ export class ProcessRuntime {
     await withFileMutationQueue(this.statePath(this.keyOf(bound)), () => this.recordObservationQueued(bound, summary, execution));
   }
 
-  private async recordObservationQueued(bound: { projectId: string; checkoutId: string; day: string }, summary: string, execution?: HostExecution): Promise<void> {
+  private async recordObservationQueued(bound: { location?: string; projectId: string; checkoutId: string; day: string }, summary: string, execution?: HostExecution): Promise<void> {
     const state = await this.load(this.keyOf(bound));
     const collected = await this.currentSources();
     const index = await this.loadManifest(this.keyOf(bound));
@@ -1088,16 +1193,23 @@ export class ProcessRuntime {
       ? sha256(`prjct:verification-command:v1\0${command}`)
       : undefined;
     const verification = Boolean(command && index?.profile.tests.command && command === index.profile.tests.command.trim());
+    const commandInputs = new Set((command?.match(/[A-Za-z0-9_./-]+\.(?:[cm]?[jt]sx?|py|rb|rs|go)/g) ?? [])
+      .map(path => path.replace(/^\.\//, '')));
+    const verificationSubstrate = commandIdentity ? sha256(JSON.stringify(Object.entries(collected.hashes)
+      .filter(([path]) => commandInputs.has(path) || /(^|\/)(package\.json|pyproject\.toml|Cargo\.toml|go\.mod|[^/]*(?:test|spec)[^/]*)$/i.test(path))
+      .sort(([a], [b]) => a.localeCompare(b)))) : undefined;
     const supports = execution?.sourcePaths?.length
       ? execution.sourcePaths.filter(path => collected.hashes[path] !== undefined).map(path => ({ id: sourceId(path), revision: index?.appliedRevision ?? 1, contentHash: collected.hashes[path]! }))
       : [{ id: `repr_${bound.projectId}`, revision: index?.appliedRevision ?? 1, contentHash: collected.manifestHash }];
     const redactedExecution = execution ? { ...execution, ...(execution.command ? { command: redactSecrets(execution.command) } : {}) } : undefined;
-    const observed = redactedExecution && (!redactedExecution.beforeHash || redactedExecution.beforeHash === collected.manifestHash)
+    const expectedMutation = redactedExecution && ['edit', 'write'].includes(redactedExecution.toolName);
+    const observed = redactedExecution && (expectedMutation || !redactedExecution.beforeHash || redactedExecution.beforeHash === collected.manifestHash)
       ? redactedExecution : redactedExecution ? { ...redactedExecution, outcome: 'unknown' as const } : undefined;
     const observation: ObservationRow = { id: newId('obs'), provenance: observed ? 'native_observation' : 'agent_report',
-      summary: redactSecrets(summary).slice(0, 4096), supports, attemptId: this.attemptId, ...(state.selectedWorkId ? { workId: state.selectedWorkId } : {}),
+      summary: redactSecrets(summary).slice(0, 4096), supports, attemptId: this.attemptId, sessionId: this.sessionId,
+      checkoutId: bound.checkoutId, ...(state.selectedWorkId ? { workId: state.selectedWorkId } : {}),
       ...(task ? { taskId: task.id } : {}), ...(observed ? { execution: observed } : {}), verification,
-      ...(observed && commandIdentity ? { commandIdentity } : {}) };
+      ...(observed && commandIdentity ? { commandIdentity } : {}), ...(verificationSubstrate ? { verificationSubstrate } : {}) };
     // Retention is reference aware. Never discard evidence pinned by a checkpoint.
     const references = new Set(state.checkpoints.flatMap(entry => {
       const data = entry.data as { evidenceIds?: string[]; judgments?: Array<{ evidenceIds: string[] }> } | undefined;
@@ -1118,6 +1230,13 @@ export class ProcessRuntime {
 
   async sourceSnapshot(): Promise<string> { return (await this.currentSources()).manifestHash; }
 
+  async sourceStamp(): Promise<{ manifestHash: string; coverage: 'partial' }> {
+    // The representation deliberately omits non-source files, large/binary
+    // content, modes, symlinks, processes and network effects. Never claim this
+    // manifest is a complete sandbox or a complete shell-effects snapshot.
+    return { manifestHash: (await this.currentSources()).manifestHash, coverage: 'partial' };
+  }
+
   private async requireEvidence(state: Document, ids: string[], scope: { workId?: string; taskId?: string }, verification = false): Promise<ObservationRow[]> {
     if (!ids.length) fail('MISSING_EVIDENCE', 'At least one actual observation is required.');
     const current = await this.currentSources();
@@ -1125,6 +1244,9 @@ export class ProcessRuntime {
       const row = state.observations.find(item => item.id === id);
       if (!row) return fail('MISSING_EVIDENCE', `Observation ${id} does not exist.`);
       if (row.provenance !== 'native_observation' || !row.execution || row.execution.outcome === 'unknown') fail('UNVERIFIABLE_EVIDENCE', 'Observation has no attributable execution outcome.');
+      if (row.attemptId !== this.attemptId || row.sessionId !== this.sessionId || row.checkoutId !== state.checkoutId) {
+        fail('ATTEMPT_MISMATCH', 'Observation belongs to another attempt, session, or checkout and must be re-recorded.');
+      }
       if (scope.workId && row.workId !== scope.workId || scope.taskId && row.taskId !== scope.taskId) fail('SCOPE_MISMATCH', 'Observation belongs to another work/task.');
       if (!row.supports.length || row.supports.some(support => this.staleSupport(support, current))) fail('STALE_EVIDENCE', 'Observation no longer covers current source content.');
       if (verification && (!row.verification || row.execution!.outcome !== 'succeeded')) fail('UNVERIFIABLE_EVIDENCE', 'Completion needs a successful project verification command.');
@@ -1133,14 +1255,30 @@ export class ProcessRuntime {
   }
 
   private async assertWorkCompletion(state: Document, work: WorkRow, assessment: CheckpointRow): Promise<void> {
-    const data = assessment.data as { specificationRevision: number; planRevision: number; judgments: Array<{ criterionId: string; conclusion: string; evidenceIds: string[] }> };
+    const data = assessment.data as { specificationRevision: number; planRevision: number; taskAssessments: Ref[];
+      judgments: Array<{ criterionId: string; conclusion: string; evidenceIds: string[] }> };
     if (!data || data.specificationRevision !== (work.activeSpecification?.revision ?? 0) || data.planRevision !== (work.activePlan?.revision ?? 0)) fail('INCOMPLETE_ASSESSMENT', 'Assessment does not cover the active revisions.');
     const criteria = state.plans.find(plan => plan.id === work.activeSpecification?.id)?.criterionIds ?? data.judgments.map(j => j.criterionId);
     if (!criteria.length || new Set(data.judgments.map(j => j.criterionId)).size !== data.judgments.length || criteria.some(id => !data.judgments.some(j => j.criterionId === id && j.conclusion === 'satisfied'))) fail('INCOMPLETE_ASSESSMENT', 'Assessment must cover every criterion without ambiguity.');
     if (state.tasks.some(task => task.workId === work.id && !['completed', 'cancelled'].includes(task.disposition))) fail('INCOMPLETE_ASSESSMENT', 'Open tasks remain.');
+    const completedTasks = state.tasks.filter(task => task.workId === work.id && task.disposition === 'completed');
+    const taskAssessments = (data.taskAssessments ?? []).map(reference => {
+      const row = state.checkpoints.find(item => item.id === reference.id && item.workId === work.id && item.kind === 'assessment');
+      const current = row ? contentRef(row.id, 1, row) : undefined;
+      if (!row || current!.revision !== reference.revision || current!.contentHash !== reference.contentHash) {
+        return fail('INCOMPLETE_ASSESSMENT', `Task assessment ${reference.id} is missing, stale, or outside this work.`);
+      }
+      return row;
+    });
+    if (new Set(taskAssessments.map(row => row.taskId)).size !== taskAssessments.length
+      || completedTasks.some(task => !taskAssessments.some(row => row.taskId === task.id))
+      || taskAssessments.some(row => !completedTasks.some(task => task.id === row.taskId))) {
+      fail('INCOMPLETE_ASSESSMENT', 'Work completion must pin exactly one current assessment for every completed task.');
+    }
+    const needsVerification = Boolean((await this.loadManifest(this.keyOf(state)))?.profile.tests.command);
     for (const judgment of data.judgments) {
       if (judgment.conclusion !== 'satisfied') fail('INCOMPLETE_ASSESSMENT', 'An assessment criterion is not satisfied.');
-      const evidence = await this.requireEvidence(state, judgment.evidenceIds, { workId: work.id });
+      const evidence = await this.requireEvidence(state, judgment.evidenceIds, { workId: work.id }, needsVerification);
       if (!evidence.some(row => row.execution?.outcome === 'succeeded')) fail('UNVERIFIABLE_EVIDENCE', 'Satisfied work criteria cannot rely only on failed executions.');
     }
   }
@@ -1373,7 +1511,7 @@ export class ProcessRuntime {
     }
     if (action === 'claim') {
       const checkoutId = String(params.checkoutId);
-      if (checkoutId !== state.checkoutId) fail('CHECKOUT_MISMATCH', `This checkout is ${state.checkoutId}; the claim names ${checkoutId}.`);
+      if (checkoutId !== bound.checkoutId || state.checkoutId !== bound.checkoutId) fail('CHECKOUT_MISMATCH', `This host checkout is ${bound.checkoutId}; the claim names ${checkoutId}.`);
       if (['completed', 'cancelled'].includes(task.disposition)) fail('INVALID_TRANSITION', 'Terminal tasks cannot be claimed.');
       if (this.isBlocked(state, task).length) fail('TASK_BLOCKED', 'Resolve blocking tasks before claiming this task.');
       const access = String(params.access) as 'read' | 'write';
@@ -1387,6 +1525,11 @@ export class ProcessRuntime {
         if (writer?.standing === 'uncertain') fail('RECONCILE_REQUIRED', 'Writer ownership is uncertain.');
         if (writer?.standing === 'valid' && writer.attemptId !== this.attemptId) {
           fail('CLAIM_CONFLICT', 'The checkout already has a writer from another attempt.');
+        }
+        const request = this.approvalRequest('Grant this exact write authority?', { workId: task.workId, taskId: task.id, checkoutId,
+          expectedRevision: params.expectedRevision, operationId: params.operationId });
+        if (!await this.transaction.getStore()?.confirm?.(request.prompt)) {
+          fail('CONFIRMATION_REQUIRED', 'Write access requires current host confirmation; headless execution cannot grant it.');
         }
       }
       const taskGeneration = (existing?.generation ?? 0) + 1;
@@ -1545,7 +1688,9 @@ export class ProcessRuntime {
         fail('STALE_REVISION', 'The adoption candidate changed after it was pinned.');
       }
       if (row.standing === 'superseded') fail('INVALID_TRANSITION', 'A superseded plan cannot be adopted.');
-      if (!await this.transaction.getStore()?.confirm?.(`Adopt exact candidate ${JSON.stringify(params.candidate)} for work ${work.id}?`)) fail('CONFIRMATION_REQUIRED', 'Plan adoption requires current host confirmation.');
+      const request = this.approvalRequest('Adopt this exact plan candidate?', { workId: work.id, candidate: params.candidate,
+        expectedRevision: params.expectedRevision, operationId: params.operationId });
+      if (!await this.transaction.getStore()?.confirm?.(request.prompt)) fail('CONFIRMATION_REQUIRED', 'Plan adoption requires current host confirmation.');
       const plans = state.plans.map(item => item.workId === work.id && item.kind === row.kind && item.standing === 'active'
         ? { ...item, standing: 'superseded' as const, nextAction: `Superseded by ${row.id}.` }
         : item.id === row.id ? { ...row, standing: 'active' as const, nextAction: 'Active revision.' } : item);
@@ -1567,7 +1712,7 @@ export class ProcessRuntime {
     return fail('INVALID_RESULT', 'Plan action is not implemented in this slice.');
   }
 
-  private async checkpoint(params: Record<string, unknown>, signal?: AbortSignal) {
+  private async checkpoint(params: Record<string, unknown>, signal?: AbortSignal, confirm?: (message: string) => Promise<boolean>) {
     const bound = await this.peekBinding();
     if (!bound) return fail('UNAVAILABLE', 'No bound project.');
     const state = await this.load(this.keyOf(bound));
@@ -1576,6 +1721,7 @@ export class ProcessRuntime {
       state.observations.find(item => item.id === id)?.provenance ?? 'agent_report';
     if (params.kind === 'progress' && (params.evidenceIds as string[]).length) await this.requireEvidence(state, params.evidenceIds as string[], { workId: String(params.workId), taskId: String(params.taskId) });
     if (params.kind === 'decision_reference') await this.requireEvidence(state, [String(params.observationId)], { workId: String(params.workId), taskId: String(params.taskId) });
+    let approvalChallenge: string | undefined;
     if (params.kind === 'progress') {
       const methodId = String(params.methodId);
       const stage = String(params.stage);
@@ -1588,9 +1734,16 @@ export class ProcessRuntime {
       const previous = [...state.checkpoints].reverse().find(row => row.workId === params.workId && row.taskId === params.taskId && row.kind === 'progress' && (row.data as { methodId?: string } | undefined)?.methodId === methodId);
       const from = (previous?.data as { stage?: string } | undefined)?.stage ?? stages[0]!;
       assertMethodProgress({ methodId: known, from, to: stage, evidence });
-      const userInput = evidenceRows.some(row => row.execution?.toolName === 'user_input');
+      const approval = (label: string) => this.approvalRequest(label, { workId: params.workId, taskId: params.taskId, methodId, stage,
+        summary: redactSecrets(String(params.summary)).slice(0, 1024), evidenceIds, expectedRevision: params.expectedRevision, operationId: params.operationId });
       if (methodId === 'tdd') {
-        if (stage === 'seam_confirmed' && !userInput) fail('UNVERIFIABLE_EVIDENCE', 'Public test seams require a current user confirmation observation.');
+        if (stage === 'seam_confirmed') {
+          const request = approval('Confirm this exact public test seam for TDD.');
+          if (!await confirm?.(request.prompt)) {
+            fail('CONFIRMATION_REQUIRED', 'Public test seams require current host confirmation; conversational input alone is not authority.');
+          }
+          approvalChallenge = request.challenge;
+        }
         if (stage === 'red_observed' || stage === 'green_observed') {
           const rows = await this.requireEvidence(state, evidenceIds, { workId: String(params.workId), taskId: String(params.taskId) });
           const outcome = stage === 'red_observed' ? 'failed' : 'succeeded';
@@ -1606,10 +1759,14 @@ export class ProcessRuntime {
           }
         }
       }
-      // Human decisions require a real user observation captured from Pi input,
-      // not a source read or an agent report.
+      // Conversational input is retained as evidence, never as reusable authority.
+      // The exact transition is authorized once through the current host UI.
       if ((methodId === 'grilling' && stage === 'decision_recorded') || (methodId === 'to-spec' && stage === 'seams_confirmed')) {
-        if (!userInput) fail('UNVERIFIABLE_EVIDENCE', 'A recorded human decision requires a native user-input observation from this work.');
+        const request = approval(`Confirm this exact ${methodId}/${stage} decision.`);
+        if (!await confirm?.(request.prompt)) {
+          fail('CONFIRMATION_REQUIRED', 'This human decision requires current host confirmation; conversational input alone is not authority.');
+        }
+        approvalChallenge = request.challenge;
       }
       // A handoff is ready only when its portable artifact actually exists.
       if (methodId === 'handoff' && stage === 'ready'
@@ -1646,7 +1803,7 @@ export class ProcessRuntime {
             taskAssessments: params.taskAssessments ?? [], judgments: params.judgments as unknown[] }
         : kind === 'progress'
           ? { methodId: String(params.methodId), stage: String(params.stage), summary: String(params.summary),
-              evidenceIds: (params.evidenceIds as string[] | undefined) ?? [] }
+              evidenceIds: (params.evidenceIds as string[] | undefined) ?? [], ...(approvalChallenge ? { approvalChallenge } : {}) }
           : kind === 'decision_reference'
             ? { questionId: String(params.questionId), observationId: String(params.observationId), subject: String(params.subject) }
             : kind === 'reuse_assessment' ? params.data : undefined;
@@ -1718,7 +1875,10 @@ export class ProcessRuntime {
           fail('MISSING_EVIDENCE', `Observation ${id} is not recorded; absence is not proof the predecessor stopped.`);
         }
       }
-      if (!await this.transaction.getStore()?.confirm?.(`Take over task ${String(params.taskId)} from ${String(params.predecessorAttemptId)}? Confirm that the predecessor has stopped; unknown effects will remain unknown.`)) fail('CONFIRMATION_REQUIRED', 'Continuation requires current host confirmation that the predecessor has stopped.');
+      const request = this.approvalRequest('Take over this exact task? Confirm that the predecessor has stopped; unknown effects remain unknown.', {
+        workId: params.workId, taskId: params.taskId, predecessorAttemptId: params.predecessorAttemptId, observationIds,
+        expectedRevision: params.expectedRevision, operationId: params.operationId });
+      if (!await this.transaction.getStore()?.confirm?.(request.prompt)) fail('CONFIRMATION_REQUIRED', 'Continuation requires current host confirmation that the predecessor has stopped.');
       const generation = (grant?.generation ?? 0) + 1;
       const grants = {
         tasks: { ...state.grants.tasks, [task.id]: { attemptId: this.attemptId, generation, standing: 'valid' as const } },

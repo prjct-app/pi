@@ -23,6 +23,7 @@ test('Pi init connects and indexes headlessly, analyze synthesizes supported con
   const oldEnv = { ...process.env };
   process.env.PRJCT_HOME = home; process.env.PI_CODING_AGENT_DIR = agentDir; process.env.PI_OFFLINE = '1';
   const sessions: AgentSession[] = [];
+  const managers: SessionManager[] = [];
   t.after(async () => { sessions.forEach(s => s.dispose()); process.env = oldEnv; await rm(root, { recursive: true, force: true }); });
   const faux = fauxProvider({ provider: 'prjct-sdk-continuity', tokensPerSecond: 1_000_000 });
   const models = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsStore: new InMemoryModelsStore(), modelsPath: null, allowModelNetwork: false, refreshOnCreate: false });
@@ -32,7 +33,8 @@ test('Pi init connects and indexes headlessly, analyze synthesizes supported con
     const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
       extensionFactories: [{ name: 'prjct', factory: extension }] });
     await loader.reload();
-    const result = await createAgentSession({ cwd, agentDir, resourceLoader: loader, settingsManager, modelRuntime: models, model: faux.getModel(), sessionManager: SessionManager.inMemory(cwd), tools: ['read', 'bash', ...processToolNames] });
+    const sessionManager = SessionManager.inMemory(cwd); managers.push(sessionManager);
+    const result = await createAgentSession({ cwd, agentDir, resourceLoader: loader, settingsManager, modelRuntime: models, model: faux.getModel(), sessionManager, tools: ['read', 'edit', 'write', 'bash', ...processToolNames] });
     sessions.push(result.session); return result.session;
   }
   const tool = (name: string, args: Record<string, unknown>) => fauxAssistantMessage(fauxToolCall(name, args), { stopReason: 'toolUse' });
@@ -61,9 +63,24 @@ test('Pi init connects and indexes headlessly, analyze synthesizes supported con
   const index = (await readRecord(join(home, 'identity/index.json')))!.payload as { bindings: Array<{ day: string; projectId: string }> };
   const b = index.bindings[0]!;
   const statePath = join(home, b.day, b.projectId, 'work/state.json');
-  const state = () => readRecord(statePath).then(r => r!.payload as { claims: Array<{ standing: string }>; observations: Array<{ id: string; provenance: string; verification: boolean; execution: { command?: string; toolCallId: string; outcome: string } }> });
+  const state = () => readRecord(statePath).then(r => r!.payload as { claims: Array<{ standing: string }>; observations: Array<{ id: string; provenance: string; verification: boolean;
+    attemptId?: string; sessionId?: string; checkoutId?: string; execution: { command?: string; toolCallId: string; outcome: string; coverage?: string } }> });
   assert.match((await readRecord(join(home, b.day, b.projectId, 'knowledge/context/purpose.json')))?.payload ? JSON.stringify((await readRecord(join(home, b.day, b.projectId, 'knowledge/context/purpose.json')))!.payload) : '', /# Purpose/);
   await first.prompt('/prjct work repair scheduling');
+  faux.setResponses([
+    tool('edit', { path: 'README.md', edits: [{ oldText: '# Harbor', newText: '# Mutated' }] }),
+    fauxAssistantMessage('The managed edit was denied.'),
+  ]);
+  await first.prompt('Try to edit without a claimed task.');
+  faux.setResponses([
+    tool('write', { path: 'forbidden.ts', content: 'export const forbidden = true;\n' }),
+    fauxAssistantMessage('The managed write was denied.'),
+  ]);
+  await first.prompt('Try to write without a claimed task.');
+  assert.equal(errors.filter(error => /TASK_GRANT_REQUIRED/.test(error)).length, 2, errors.join('\n'));
+  assert.equal(await readFile(join(cwd, 'README.md'), 'utf8'), readme);
+  assert.equal(await readFile(join(cwd, 'forbidden.ts'), 'utf8').catch(() => undefined), undefined);
+  errors.length = 0;
   faux.setResponses([
     tool('bash', { command: 'node --test check.test.mjs' }),
     ...Array.from({ length: 6 }, () => tool('bash', { command: 'printf unrelated' })),
@@ -74,6 +91,8 @@ test('Pi init connects and indexes headlessly, analyze synthesizes supported con
   const observation = (await state()).observations.find(o => o.execution?.command === 'node --test check.test.mjs');
   assert.equal(observation?.provenance, 'native_observation'); assert.equal(observation?.verification, true);
   assert.equal(observation?.execution.outcome, 'succeeded'); assert.ok(observation?.execution.toolCallId);
+  assert.equal(observation?.execution.coverage, 'partial', 'bash never claims full filesystem/sandbox coverage');
+  assert.ok(observation?.attemptId && observation?.sessionId && observation?.checkoutId, 'evidence is bound to host lifecycle identity');
   const beforeCount = faux.state.callCount;
   await first.prompt('/prjct sync'); await first.agent.waitForIdle();
   assert.equal(faux.state.callCount, beforeCount, 'Current supported knowledge does not require redundant synthesis');
@@ -82,6 +101,8 @@ test('Pi init connects and indexes headlessly, analyze synthesizes supported con
   await second.prompt('Continue the existing work without another project explanation.');
   const response = second.messages.find(m => m.role === 'toolResult' && m.toolName === 'prjct_context');
   assert.match(JSON.stringify(response), /Fixture purpose brief/); assert.match(JSON.stringify(response), /repair scheduling/);
+  assert.ok(managers.at(-1)!.getEntries().some(entry => entry.type === 'custom' && entry.customType === 'prjct_binding'),
+    'the active branch persists a context-only binding pointer');
   assert.equal(await readFile(join(cwd, 'README.md'), 'utf8'), readme);
   assert.deepEqual((await readdir(cwd)).sort(), ['README.md', 'check.test.mjs', 'package.json']);
 });

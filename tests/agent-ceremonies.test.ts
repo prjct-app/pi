@@ -93,7 +93,7 @@ test('ship refuses with open tasks and completes the work when the assessment is
     assert.match(await runtime.ship(), /Ship refused: open tasks/);
 
     const { checkoutId } = await ids();
-    await runtime.execute('prjct_task', { action: 'claim', workId, taskId: 't1', checkoutId, access: 'write', operationId: 'op_c', expectedRevision: await rev(), maxBytes: 4096 });
+    await runtime.execute('prjct_task', { action: 'claim', workId, taskId: 't1', checkoutId, access: 'write', operationId: 'op_c', expectedRevision: await rev(), maxBytes: 4096 }, { confirm: async () => true });
     await observeNative(runtime);
     const state = await readRecord(join(scopeStore(runtime.prjctRoot, (await ids()).key, 'work'), 'state.json'));
     const obsId = (state!.payload as { observations: Array<{ id: string }> }).observations[0]!.id;
@@ -102,15 +102,22 @@ test('ship refuses with open tasks and completes the work when the assessment is
       judgments: [{ criterionId: 'c1', conclusion: 'satisfied', evidenceIds: [obsId], rationale: 'pass' }],
       operationId: 'op_a', expectedRevision: await rev(), maxBytes: 4096,
     });
-    const assessmentId = (assessment.details as { recorded: { reference: { id: string } } }).recorded.reference.id;
-    await runtime.execute('prjct_task', { action: 'transition', workId, taskId: 't1', transition: 'complete', assessmentId,
+    const assessmentRef = (assessment.details as { recorded: { reference: { id: string; revision: number; contentHash: string } } }).recorded.reference;
+    await runtime.execute('prjct_task', { action: 'transition', workId, taskId: 't1', transition: 'complete', assessmentId: assessmentRef.id,
       operationId: 'op_done', expectedRevision: await rev(), maxBytes: 4096 });
 
     assert.match(await runtime.ship(), /Ship refused: no recorded work assessment/);
 
     await runtime.execute('prjct_checkpoint', {
       action: 'record', workId, kind: 'work_assessment', specificationRevision: 0, planRevision: 0,
-      taskAssessments: [], judgments: [{ criterionId: 'c1', conclusion: 'satisfied', evidenceIds: [obsId], rationale: 'pass' }],
+      taskAssessments: [], judgments: [{ criterionId: 'c1', conclusion: 'satisfied', evidenceIds: [obsId], rationale: 'missing task pin' }],
+      operationId: 'op_bad_wa', expectedRevision: await rev(), maxBytes: 4096,
+    });
+    assert.match(await runtime.ship(), /Ship refused: .*exactly one current assessment/);
+
+    await runtime.execute('prjct_checkpoint', {
+      action: 'record', workId, kind: 'work_assessment', specificationRevision: 0, planRevision: 0,
+      taskAssessments: [assessmentRef], judgments: [{ criterionId: 'c1', conclusion: 'satisfied', evidenceIds: [obsId], rationale: 'pass' }],
       operationId: 'op_wa', expectedRevision: await rev(), maxBytes: 4096,
     });
     assert.match(await runtime.ship(), /completed/);
