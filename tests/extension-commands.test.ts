@@ -19,7 +19,7 @@ const stubHost = () => {
   const commands = new Map<string, CommandOptions>();
   const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
   const sent: Array<{ text: string; options: unknown }> = [];
-  const messages: Array<{ message: { content: string }; options: unknown }> = [];
+  const messages: Array<{ message: Record<string, unknown>; options: unknown }> = [];
   const entries: unknown[] = [];
   let active: string[] = [];
   const pi = {
@@ -27,7 +27,7 @@ const stubHost = () => {
     registerCommand: (name: string, options: CommandOptions) => commands.set(name, options),
     on: (event: string, handler: (event: unknown, ctx: unknown) => unknown) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
     sendUserMessage: (text: string, options: unknown) => sent.push({ text, options }),
-    sendMessage: async (message: { content: string }, options: unknown) => { messages.push({ message, options }); },
+    sendMessage: async (message: Record<string, unknown>, options: unknown) => { messages.push({ message, options }); },
     appendEntry: (_type: string, data: unknown) => entries.push(data),
     getActiveTools: () => active,
     setActiveTools: (names: string[]) => { active = names; },
@@ -163,7 +163,7 @@ test('/prjct init connects and runs services without prompting the model; status
   assert.match(notices.at(-1) ?? '', /Queued: purpose, patterns \(child Pi, faux\/brief-model, thinking low\)/);
   assert.equal(host.sent.length, 0, 'the session model is never prompted');
   assert.equal(host.messages.length, 2, 'one next-turn line per finished brief');
-  assert.match(host.messages[0]?.message.content ?? '', /purpose brief is ready/);
+  assert.match(String(host.messages[0]?.message.content ?? ''), /purpose brief is ready/);
   assert.deepEqual(host.messages[0]?.options, { deliverAs: 'nextTurn' });
   const runtime = new ProcessRuntime({ cwd, agentHome, prjctHome: join(root, 'store') });
   const purpose = await runtime.readContextDoc('purpose');
@@ -220,4 +220,57 @@ test('/prjct offers argument completions for subcommands and run services', asyn
   assert.deepEqual(values('run p'), ['run purpose', 'run patterns']);
   assert.deepEqual(values('work '), []);
   assert.equal(complete('work '), null, 'no suggestions where the command takes free text');
+});
+
+test('TUI action results are handed to the model for a human summary; headless never triggers a turn', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'prjct-summaries-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'client'), agentHome = join(root, 'agent');
+  await mkdir(cwd); await mkdir(agentHome);
+  await writeFile(join(cwd, 'README.md'), '# Client\n');
+  const previousEnv = { ...process.env };
+  process.env.PI_CODING_AGENT_DIR = agentHome;
+  process.env.PRJCT_HOME = join(root, 'store');
+  t.after(() => { process.env = previousEnv; });
+
+  const host = stubHost();
+  prjctExtension(host.pi);
+  const notices: string[] = [];
+  const tui = { ...stubCtx(cwd, notices), hasUI: true, mode: 'tui' as const };
+  const run = (args: string) => host.commands.get('prjct')!.handler(args, tui);
+  const waitFor = async (cond: () => boolean, ms = 10_000) => {
+    const start = Date.now();
+    while (!cond()) {
+      if (Date.now() - start > ms) throw new Error('timed out waiting for the model handoff');
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  };
+
+  // Synchronous outcome (error): immediate handoff with a followUp turn trigger.
+  await run('status');
+  assert.equal(host.messages.length, 1);
+  const first = host.messages[0]!;
+  assert.deepEqual(first.options, { deliverAs: 'followUp', triggerTurn: true });
+  assert.match(String(first.message.content), /No bound project/);
+  assert.equal(first.message.display, false, 'raw machine text stays out of the transcript');
+
+  // Queued work ack does not hand off; the runner idle summary does.
+  await run('init');
+  assert.equal(host.messages.length, 1, 'queued ack is a plain notification');
+  await waitFor(() => host.messages.length === 2);
+  const idle = host.messages[1]!;
+  assert.match(String(idle.message.content), /prjct services finished/);
+  assert.match(String(idle.message.content), /index \([\d.]+s\):/);
+
+  // A later synchronous status hands off again.
+  await run('status');
+  assert.equal(host.messages.length, 3);
+  assert.match(String(host.messages[2]!.message.content), /Services:/);
+
+  // Headless mode: same command, no model handoff at all.
+  const headlessCtx = { ...stubCtx(cwd, notices), mode: 'print' as const };
+  await host.commands.get('prjct')!.handler('status', headlessCtx);
+  assert.equal(host.messages.length, 3, 'headless never triggers a model turn');
+
+  for (const handler of host.handlers.get('session_shutdown') ?? []) await handler({}, tui);
 });
