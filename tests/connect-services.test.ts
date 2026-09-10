@@ -92,6 +92,8 @@ test('init connects without indexing; services then produce the index, stack and
   assert.match(prompt, new RegExp(`checkoutId ${id.checkoutId}`));
   assert.match(prompt, /Documentation files present: README\.md/);
   assert.match(prompt, /verifies with `node --test`/);
+  assert.match(prompt, /Write prjct output in English for coding agents/);
+  assert.match(prompt, /actionable facts.*checkable completion criteria.*prune exposition, duplication, and no-ops/);
   assert.equal((lookup.details as { stateRevision?: number }).stateRevision !== undefined, true, 'lookup exposes stateRevision');
 
   // A new commit makes history stale, an edit makes index and stack stale; sync queues exactly those.

@@ -1,3 +1,4 @@
+import { AGENT_OUTPUT_POINTER } from '../agent-output.ts';
 import { ContextParameters } from './context-contract.ts';
 
 // Definition fragment only. A working owner must provide execute; this does not
@@ -5,6 +6,6 @@ import { ContextParameters } from './context-contract.ts';
 export const ContextToolContract = {
   name: 'prjct_context',
   label: 'Project context',
-  description: 'Call this BEFORE answering about prior work, project purpose, findings, or next actions in this directory — retained context lives here. Also serves on-demand method guidance (query methods / method:<id> / method:<id>/<doc>) and prjct capability discovery.',
+  description: `Call this BEFORE answering about prior work, project purpose, findings, or next actions in this directory — retained context lives here. Also serves on-demand method guidance (query methods / method:<id> / method:<id>/<doc>) and prjct capability discovery. ${AGENT_OUTPUT_POINTER}`,
   parameters: ContextParameters,
 };

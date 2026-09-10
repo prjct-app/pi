@@ -2,6 +2,7 @@ import { homedir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { AGENT_OUTPUT_INSTRUCTION } from './agent-output.ts';
 import { ProcessRuntime, type HostExecution } from './pi/process-runtime.ts';
 import { createProcessTools, processToolNames } from './pi/register-tools.ts';
 import { newId } from './workspace/ids.ts';
@@ -49,13 +50,12 @@ export default function prjctExtension(pi: ExtensionAPI) {
   };
   for (const tool of createProcessTools(agentHome, activate, () => attempt, runtime)) pi.registerTool(tool);
 
-  // Action results must reach the user as a human summary, not machine text: in
-  // the TUI the result is handed to the model, which replies with the summary.
+  // TUI action results become concise operational receipts for the agent.
   // Headless modes stay plain stderr; no model turn is triggered there.
   const tellModel = (ctx: { hasUI: boolean; mode?: string }, text: string): void => {
     if (!ctx.hasUI || headless(ctx)) return;
     pi.sendMessage({ customType: 'prjct', display: false,
-      content: `A prjct action produced this result. Explain it to the user as one short human summary — what happened, the outcome, and the next step. Reply with only that summary; call no tools.\n${text}` },
+      content: `A prjct action produced this result. ${AGENT_OUTPUT_INSTRUCTION} Return one short operational receipt containing the outcome, material facts, and next executable step. Reply with only that receipt; call no tools.\n${text}` },
       { deliverAs: 'followUp', triggerTurn: true });
   };
   // Every command outcome gets a response; the TUI also gets the model summary.

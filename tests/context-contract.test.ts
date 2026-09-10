@@ -1,8 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { validateContextResponse, type ContextRequest } from '../src/pi/context-contract.ts';
+import { ContextToolContract } from '../src/pi/context-tool-contract.ts';
 
 const lookup = { action: 'lookup', query: 'Existing settings form design', maxBytes: 1400 } satisfies ContextRequest;
+
+test('the always-active context pointer sets the English agent-facing output policy', () => {
+  assert.match(ContextToolContract.description, /Generated prjct content is English, agent-facing, and execution-first/);
+});
 
 test('context response budget includes UTF-8 metadata, not JavaScript string length', () => {
   assert.throws(() => validateContextResponse({ ...lookup, maxBytes: 220 }, {
