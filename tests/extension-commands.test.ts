@@ -41,7 +41,7 @@ const stubCtx = (cwd: string, notices: string[]) => ({
   ui: { notify: (text: string) => notices.push(text), setStatus: () => undefined, confirm: async () => true },
 });
 
-test('headless commands keep the user informed: every command and job lifecycle event reaches stderr', async t => {
+test('headless commands keep output bounded: one aggregate receipt per queued action', async t => {
   const root = await mkdtemp(join(tmpdir(), 'prjct-headless-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const cwd = join(root, 'client'), agentHome = join(root, 'agent');
@@ -71,9 +71,8 @@ test('headless commands keep the user informed: every command and job lifecycle 
 
   await run('init');
   assert.match(errText(), /Project initialized\. Connected project p_[0-9a-f]+ .*Queued: index, stack, history\./);
-  assert.match(errText(), /prjct index…/);
-  assert.match(errText(), /prjct index done \([\d.]+s\):/);
-  assert.match(errText(), /prjct: 3 service\(s\) finished: index, stack, history\. \/prjct status/);
+  assert.match(errText(), /prjct init:\n[\s\S]*index \([\d.]+s\) done:[\s\S]*stack \([\d.]+s\) done:[\s\S]*history \([\d.]+s\) done:/);
+  assert.doesNotMatch(errText(), /prjct index…|prjct index done|service\(s\) finished/);
 
   await run('status');
   assert.match(errLines.at(-1) ?? '', /index\s+done/);
@@ -82,13 +81,13 @@ test('headless commands keep the user informed: every command and job lifecycle 
   await writeFile(join(cwd, 'NOTES.md'), '# Notes\n');
   await run('init');
   assert.match(errText(), /Project already initialized\. Reconnected project p_[0-9a-f]+ .*Refreshing out-of-date services: index, stack\. \/prjct status follows progress\./);
-  assert.match(errText(), /prjct: 2 service\(s\) finished: index, stack\. \/prjct status/);
+  assert.equal((errText().match(/prjct init:/g) ?? []).length, 2, 'each init has one final receipt');
 
-  // A failing service is reported where the user can see it, not only appended.
+  // Multiple failures are one bounded action receipt, not one dump per service.
   process.env.FAKE_PI_MODE = 'fail';
   await run('analyze');
-  assert.match(errText(), /prjct purpose failed: child pi exited 3/);
-  assert.match(errText(), /prjct patterns failed: child pi exited 3/);
+  assert.match(errText(), /prjct analyze:\n[\s\S]*purpose failed: child pi exited 3[\s\S]*patterns failed: child pi exited 3/);
+  assert.equal((errText().match(/prjct analyze:/g) ?? []).length, 1);
   delete process.env.FAKE_PI_MODE;
 
   await run('run nope');
@@ -160,13 +159,13 @@ test('/prjct init connects and runs services without prompting the model; status
 
   // The runner was created by init with brief-model. A later model switch must
   // apply to newly queued analysis jobs instead of reusing that cached choice.
+  // Headless completion never injects internal "brief ready" messages into
+  // the parent model's context.
   ctx.model = { provider: 'faux', id: 'replacement-model' };
   await run('analyze');
   assert.match(notices.at(-1) ?? '', /Queued: purpose, patterns \(child Pi, faux\/replacement-model, thinking low\)/);
   assert.equal(host.sent.length, 0, 'the session model is never prompted');
-  assert.equal(host.messages.length, 2, 'one next-turn line per finished brief');
-  assert.match(String(host.messages[0]?.message.content ?? ''), /purpose brief is ready/);
-  assert.deepEqual(host.messages[0]?.options, { deliverAs: 'nextTurn' });
+  assert.equal(host.messages.length, 0, 'headless analysis never injects parent-context messages');
   const runtime = new ProcessRuntime({ cwd, agentHome, prjctHome: join(root, 'store') });
   const purpose = await runtime.readContextDoc('purpose');
   assert.match(purpose?.text ?? '', /^# Purpose\n/);
@@ -229,7 +228,7 @@ test('/prjct offers argument completions for subcommands and run services', asyn
   assert.equal(complete('work '), null, 'no suggestions where the command takes free text');
 });
 
-test('TUI action results request concise English agent-facing output; headless never triggers a turn', async t => {
+test('every TUI action gets one compact English receipt without accumulating prompt context', async t => {
   const root = await mkdtemp(join(tmpdir(), 'prjct-summaries-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const cwd = join(root, 'client'), agentHome = join(root, 'agent');
@@ -238,6 +237,7 @@ test('TUI action results request concise English agent-facing output; headless n
   const previousEnv = { ...process.env };
   process.env.PI_CODING_AGENT_DIR = agentHome;
   process.env.PRJCT_HOME = join(root, 'store');
+  process.env.PRJCT_PI_COMMAND = `${process.execPath} ${fileURLToPath(new URL('./fake-pi.mjs', import.meta.url))}`;
   t.after(() => { process.env = previousEnv; });
 
   const host = stubHost();
@@ -253,34 +253,90 @@ test('TUI action results request concise English agent-facing output; headless n
     }
   };
 
-  // Synchronous outcome (error): immediate handoff with a followUp turn trigger.
+  // Synchronous outcome: one strict, hidden receipt request.
   await run('status');
   assert.equal(host.messages.length, 1);
   const first = host.messages[0]!;
   assert.deepEqual(first.options, { deliverAs: 'followUp', triggerTurn: true });
+  assert.equal(first.message.customType, 'prjct-action-result');
+  assert.match(String(first.message.content), /action=status/);
   assert.match(String(first.message.content), /Write prjct output in English for coding agents/);
-  assert.match(String(first.message.content), /operational receipt/);
-  assert.doesNotMatch(String(first.message.content), /Explain it to the user|same language/i);
+  assert.match(String(first.message.content), /1.?4 lines/i);
+  assert.doesNotMatch(String(first.message.content), /same language/i);
   assert.match(String(first.message.content), /No bound project/);
+  assert.ok(Buffer.byteLength(String(first.message.content), 'utf8') < 1_800, 'receipt request stays context-cheap');
   assert.equal(first.message.display, false, 'raw machine text stays out of the transcript');
 
-  // Queued work ack does not hand off; the runner idle summary does.
+  // Queued work ack does not hand off; completion produces one action receipt.
   await run('init');
   assert.equal(host.messages.length, 1, 'queued ack is a plain notification');
   await waitFor(() => host.messages.length === 2);
-  const idle = host.messages[1]!;
-  assert.match(String(idle.message.content), /prjct services finished/);
-  assert.match(String(idle.message.content), /index \([\d.]+s\):/);
+  const initialized = host.messages[1]!;
+  assert.match(String(initialized.message.content), /action=init/);
+  assert.match(String(initialized.message.content), /index \([\d.]+s\) done:/);
 
   // A later synchronous status hands off again.
   await run('status');
   assert.equal(host.messages.length, 3);
+  assert.match(String(host.messages[2]!.message.content), /action=status/);
   assert.match(String(host.messages[2]!.message.content), /Services:/);
+
+  // Every remaining action family also yields exactly one labeled receipt.
+  const expectReceipt = async (action: string, command: string) => {
+    const before = host.messages.length;
+    await run(command);
+    await waitFor(() => host.messages.length >= before + 1);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(host.messages.length, before + 1, `${command} emits exactly one receipt`);
+    assert.match(String(host.messages.at(-1)!.message.content), new RegExp(`action=${action}`));
+  };
+  await expectReceipt('sync', 'sync');
+  await expectReceipt('run', 'run stack');
+  await expectReceipt('export', 'export');
+  await expectReceipt('work', 'work');
+  await expectReceipt('ship', 'ship');
+
+  // Analyze emits exactly ONE aggregate receipt — never one queued message per brief.
+  const beforeAnalyze = host.messages.length;
+  await run('analyze');
+  await waitFor(() => host.messages.length >= beforeAnalyze + 1);
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal(host.messages.length, beforeAnalyze + 1, 'one model handoff for the entire analyze action');
+  const analyzed = host.messages.at(-1)!;
+  assert.match(String(analyzed.message.content), /action=analyze/);
+  assert.match(String(analyzed.message.content), /purpose[\s\S]*patterns/);
+  assert.deepEqual(analyzed.options, { deliverAs: 'followUp', triggerTurn: true });
+  assert.equal(host.messages.some(row => /brief is ready/.test(String(row.message.content))), false);
+
+  // Two service failures are likewise one receipt, not two context-growing turns.
+  process.env.FAKE_PI_MODE = 'fail';
+  const beforeFailure = host.messages.length;
+  await run('analyze');
+  await waitFor(() => host.messages.length >= beforeFailure + 1);
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal(host.messages.length, beforeFailure + 1, 'one aggregate failure handoff');
+  assert.match(String(host.messages.at(-1)!.message.content), /purpose[\s\S]*failed[\s\S]*patterns[\s\S]*failed/);
+  delete process.env.FAKE_PI_MODE;
+
+  // Consumed hidden receipts are removed from later LLM contexts; only a
+  // currently pending receipt survives long enough to drive its one turn.
+  const contextHandler = host.handlers.get('context')?.[0];
+  assert.ok(contextHandler, 'summary requests install a context-pruning hook');
+  const oldReceipt = { role: 'custom', customType: 'prjct-action-result', content: 'old' };
+  const legacyReceipt = { role: 'custom', customType: 'prjct', content: 'A prjct action produced this result. old' };
+  const legacyBrief = { role: 'custom', customType: 'prjct', content: 'prjct: the purpose brief is ready; lookup it.' };
+  const assistant = { role: 'assistant', content: [] };
+  const pendingReceipt = { role: 'custom', customType: 'prjct-action-result', content: 'pending' };
+  const pruned = await contextHandler!({ messages: [oldReceipt, legacyReceipt, legacyBrief, assistant, pendingReceipt] }, tui) as { messages: unknown[] };
+  assert.deepEqual(pruned.messages, [assistant, pendingReceipt]);
+  const consumed = await contextHandler!({ messages: [oldReceipt, assistant] }, tui) as { messages: unknown[] };
+  assert.deepEqual(consumed.messages, [assistant]);
 
   // Headless mode: same command, no model handoff at all.
   const headlessCtx = { ...stubCtx(cwd, notices), mode: 'print' as const };
+  const beforeHeadless = host.messages.length;
   await host.commands.get('prjct')!.handler('status', headlessCtx);
-  assert.equal(host.messages.length, 3, 'headless never triggers a model turn');
+  assert.equal(host.messages.length, beforeHeadless, 'headless never triggers a model turn');
 
   for (const handler of host.handlers.get('session_shutdown') ?? []) await handler({}, tui);
 });
