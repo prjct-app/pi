@@ -102,6 +102,22 @@ const matchDiscover = (query: string): string[] => {
 
 const MAX_OBSERVATIONS = 200;
 const MAX_HOT_RECEIPTS = 100;
+// Ordinary retained-context lookups must stay cheap even when callers offer a
+// much larger emergency budget. Direct method documents keep their requested
+// budget because they are explicitly requested long-form guidance.
+const MAX_CONTEXT_LOOKUP_BYTES = 4096;
+
+const clipUtf8 = (text: string, maxBytes: number): string => {
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+  const suffix = '…';
+  let low = 0, high = text.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(text.slice(0, middle) + suffix, 'utf8') <= maxBytes) low = middle;
+    else high = middle - 1;
+  }
+  return text.slice(0, low).trimEnd() + suffix;
+};
 
 export class ProcessRuntime {
   readonly agentHome: string;
@@ -707,25 +723,42 @@ export class ProcessRuntime {
       tasks: tasks.filter(task => task.workId === work.id).map(task => contentRef(task.id, 1, task)), nextAction: work.nextAction };
   }
 
-  private contextResult(request: { action: 'lookup' | 'discover'; query: string; maxBytes: number }, result: { status: 'ok' | 'partial' | 'abstained'; items: Array<{ kind: 'stack' | 'architecture' | 'purpose' | 'design' | 'method' | 'work' | 'history'; summary: string; standing: 'supported' | 'needs_review'; sources: Ref[] }>; gaps: string[]; stateRevision?: number }): ToolResult {
-    let trimmed = false;
-    while (result.items.length > 32 || (result.items.length && Buffer.byteLength(JSON.stringify(result)) > request.maxBytes)) {
-      result.items.pop(); trimmed = true;
+  private contextResult(request: { action: 'lookup' | 'discover'; query: string; maxBytes: number }, result: { status: 'ok' | 'partial' | 'abstained'; items: Array<{ kind: 'stack' | 'architecture' | 'purpose' | 'design' | 'method' | 'work' | 'history'; summary: string; standing: 'supported' | 'needs_review'; sources: Ref[] }>; gaps: string[]; stateRevision?: number }, maxBytes = request.maxBytes): ToolResult {
+    const budget = Math.min(request.maxBytes, maxBytes);
+    result = { ...result, items: result.items.map(item => ({ ...item })), gaps: [...result.gaps] };
+    let compacted = false;
+    while (result.items.length > 32) { result.items.pop(); compacted = true; }
+    if (Buffer.byteLength(JSON.stringify(result), 'utf8') > budget) compacted = true;
+    if (compacted) {
       result.status = 'partial';
-      if (!result.gaps.includes('Context budget reached; request a narrower query or a larger budget.')) result.gaps.push('Context budget reached; request a narrower query or a larger budget.');
+      const gap = 'Context compacted; use a narrower query for full detail.';
+      if (!result.gaps.includes(gap)) result.gaps.push(gap);
     }
-    void trimmed;
+    while (result.items.length && Buffer.byteLength(JSON.stringify(result), 'utf8') > budget) {
+      const longest = result.items.reduce((best, item, index) =>
+        Buffer.byteLength(item.summary, 'utf8') > Buffer.byteLength(result.items[best]!.summary, 'utf8') ? index : best, 0);
+      const item = result.items[longest]!;
+      const summaryBytes = Buffer.byteLength(item.summary, 'utf8');
+      if (summaryBytes > 192) {
+        const overflow = Buffer.byteLength(JSON.stringify(result), 'utf8') - budget;
+        item.summary = clipUtf8(item.summary, Math.max(192, summaryBytes - overflow - 16));
+      } else {
+        result.items.pop();
+      }
+    }
     return jsonResult(validateContextResponse(request, result));
   }
 
   private contextObservations(state: Document, query: string, workId?: string): ObservationRow[] {
     const terms = tokenizeQuery(query);
     const wanted = state.claims.filter(claim => query.includes(claim.id)).flatMap(claim => claim.supports.map(ref => ref.id));
+    const genericEvidenceQuery = /\b(observation|observations|evidence)\b|\bobs_[a-z0-9_]+\b/i.test(query);
     return state.observations.filter(row => !workId || row.workId === workId).map((row, index) => {
       const text = `${row.id} ${row.execution?.sourcePaths?.join(' ') ?? ''} ${row.summary}`.toLowerCase();
       const score = terms.filter(term => text.includes(term)).length + (row.supports.some(ref => wanted.includes(ref.id)) ? 100 : 0);
       return { row, index, score };
-    }).sort((a, b) => b.score - a.score || b.index - a.index).slice(0, 5).map(item => item.row);
+    }).filter(item => genericEvidenceQuery || item.score > 0)
+      .sort((a, b) => b.score - a.score || b.index - a.index).slice(0, 5).map(item => item.row);
   }
 
   private async context(params: Record<string, unknown>, extras: { signal?: AbortSignal; activate?: (names: string[]) => void }) {
@@ -786,70 +819,97 @@ export class ProcessRuntime {
     }
     const state = await this.load(this.keyOf(bound));
     const work = state.works.find(item => item.id === state.selectedWorkId);
+    const query = request.query.toLowerCase();
+    const pathQuery = /[\/.]\w/.test(request.query);
+    const wantsStack = /\b(stacks?|ecosystems?|frameworks?|tools?|scripts?|commands?|verify|tests?|builds?|lint|languages?|profiles?)\b/.test(query);
+    const wantsHistory = /\b(history|releases?|changelogs?|commits?|git|ship|versions?|tags?|hotspots?|churn|contributors?|recent)\b/.test(query);
+    const wantsPurpose = /\b(purpose|overviews?|about|goals?|architecture|components?|domains?|briefs?|understand)\b|what is/.test(query);
+    const wantsDesign = /\b(patterns?|conventions?|design|styles?|testing|guidelines?|pitfalls?|practices?|structures?)\b|how to/.test(query);
+    const wantsKnowledge = /\b(claim|claims|finding|findings|knowledge|decision|decisions)\b|\bclaim_[a-z0-9_]+\b/.test(query);
+    const wantsEvidence = pathQuery || /\b(observation|observations|evidence)\b|\bobs_[a-z0-9_]+\b/.test(query);
+    const explicitWork = /\b(work|task|tasks|next|progress|plan|spec|checkpoint|journal|blocked|ready|continue|resume|current work|active work)\b/.test(query);
+    const explicitProject = wantsStack || wantsHistory || wantsPurpose || wantsDesign || wantsKnowledge || wantsEvidence;
+    const wantsProject = explicitProject || (!work && !explicitWork);
+    const wantsWork = explicitWork || Boolean(work && !explicitProject);
     let projectItems: Array<{ kind: 'stack' | 'architecture' | 'purpose' | 'method' | 'history' | 'design'; summary: string; standing: 'supported' | 'needs_review'; sources: Ref[] }> = [];
     let projectGaps: string[] = [];
     // One walk per lookup, shared by the project and work blocks.
     const current = await this.currentSources();
-    {
-      // Project knowledge remains present alongside a work cycle: answer what the project IS. Mechanical profile plus
-      // supported claims; purpose/patterns remain agent-synthesized claims.
+    if (wantsProject) {
       const index = await this.loadManifest(this.keyOf(bound));
       const items: Array<{ kind: 'stack' | 'architecture' | 'purpose' | 'method' | 'history' | 'design'; summary: string; standing: 'supported' | 'needs_review'; sources: Ref[] }> = [];
       const gaps: string[] = [];
-      if (index && index.manifestHash !== current.manifestHash) gaps.push('Sources changed; review supported knowledge before applying it.');
+      if (index && index.manifestHash !== current.manifestHash) gaps.push('Sources changed; review retained context before applying it.');
       const docItems = await this.contextDocItems(request.query, bound.projectId);
-      // The stack brief subsumes the mechanical profile lines: never serve both.
-      if (index && !docItems.some(item => item.kind === 'stack')) {
+      const needsMechanicalProfile = wantsStack || (wantsPurpose && !docItems.some(item => item.kind === 'purpose'));
+      // One compact profile item avoids repeating the same representation source
+      // across separate stack, test, and documentation rows.
+      if (index && needsMechanicalProfile && !docItems.some(item => item.kind === 'stack')) {
         const profile = index.profile;
-        const scriptNames = Object.keys(profile.scripts);
-        items.push({ kind: 'stack', standing: 'supported',
-          summary: `ecosystem ${profile.ecosystem}; languages ${Object.entries(profile.languages).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([ext, count]) => `${ext}:${count}`).join(' ')}; tools ${profile.tools.join(', ') || 'none'}; frameworks ${profile.frameworks.join(', ') || 'none'}; scripts ${scriptNames.join(', ') || 'none'}; top dirs ${profile.topDirs.join(', ') || '.'}`,
+        const summary = [
+          `ecosystem ${profile.ecosystem}`,
+          `languages ${Object.entries(profile.languages).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([ext, count]) => `${ext}:${count}`).join(' ')}`,
+          `tools ${profile.tools.join(', ') || 'none'}`,
+          `frameworks ${profile.frameworks.join(', ') || 'none'}`,
+          `scripts ${Object.keys(profile.scripts).join(', ') || 'none'}`,
+          `top dirs ${profile.topDirs.join(', ') || '.'}`,
+          `${index.indexedFiles} indexed files`,
+          `tests ${profile.hasTests ? 'present' : 'not detected'}`,
+          `manifests ${profile.manifests.join(', ') || 'none'}`,
+          profile.tests.framework !== 'unknown' || profile.tests.command
+            ? `verify: ${profile.tests.command ?? profile.tests.framework}${profile.tests.pattern ? `; pattern ${profile.tests.pattern}` : ''}${profile.tests.example ? `; imitate ${profile.tests.example}` : ''}` : null,
+          profile.docs.readme || profile.docs.context || profile.docs.docFiles > 0 || profile.docs.adrCount > 0
+            ? `docs: ${[
+              profile.docs.title ? `title "${profile.docs.title}"` : null,
+              profile.docs.context ? 'CONTEXT.md glossary' : null,
+              profile.docs.contextMap ? 'CONTEXT-MAP (multiple contexts)' : null,
+              profile.docs.agents ? 'AGENTS.md' : null,
+              profile.docs.docFiles ? `${profile.docs.docFiles} docs/` : null,
+              profile.docs.adrCount ? `${profile.docs.adrCount} ADRs` : null,
+            ].filter(Boolean).join('; ')}${profile.docs.headings.length ? `. headings: ${profile.docs.headings.slice(0, 6).join(' | ')}` : ''}` : null,
+        ].filter(Boolean).join('; ');
+        items.push({ kind: 'stack', summary, standing: 'supported',
           sources: [{ id: `repr_${bound.projectId}`, revision: index.appliedRevision, contentHash: index.manifestHash }] });
-        items.push({ kind: 'stack', standing: 'supported',
-          summary: `${index.indexedFiles} indexed files; tests ${profile.hasTests ? 'present' : 'not detected'}; manifests ${profile.manifests.join(', ') || 'none'}.`,
-          sources: [{ id: `repr_${bound.projectId}`, revision: index.appliedRevision, contentHash: index.manifestHash }] });
-        if (profile.tests.framework !== 'unknown' || profile.tests.command) {
-          items.push({ kind: 'method', standing: 'supported',
-            summary: `verify: ${profile.tests.command ?? profile.tests.framework}${profile.tests.pattern ? `; pattern ${profile.tests.pattern}` : ''}${profile.tests.example ? `; imitate ${profile.tests.example}` : ''}`,
-            sources: [{ id: `repr_${bound.projectId}`, revision: index.appliedRevision, contentHash: index.manifestHash }] });
-        }
-        if (profile.docs.readme || profile.docs.context || profile.docs.docFiles > 0 || profile.docs.adrCount > 0) {
-          const parts = [
-            profile.docs.title ? `title "${profile.docs.title}"` : null,
-            profile.docs.context ? 'CONTEXT.md glossary' : null,
-            profile.docs.contextMap ? 'CONTEXT-MAP (multiple contexts)' : null,
-            profile.docs.agents ? 'AGENTS.md' : null,
-            profile.docs.docFiles ? `${profile.docs.docFiles} docs/` : null,
-            profile.docs.adrCount ? `${profile.docs.adrCount} ADRs` : null,
-          ].filter(Boolean).join('; ');
-          items.push({ kind: 'purpose', standing: 'supported',
-            summary: `docs: ${parts}${profile.docs.headings.length ? `. headings: ${profile.docs.headings.slice(0, 6).join(' | ')}` : ''}`,
-            sources: [{ id: `repr_${bound.projectId}`, revision: index.appliedRevision, contentHash: index.manifestHash }] });
-        }
-      } else {
+      } else if (!index && needsMechanicalProfile) {
         gaps.push('No applied index; run prjct_refresh to learn the project profile.');
       }
-      // A path-like query asks for evidence about that file: observations lead so a small
-      // budget still returns their obs_ ids (the confirm step depends on them).
-      const pathQuery = /[\/.]\w/.test(request.query);
-      const observationItems = !work ? this.contextObservations(state, request.query).map(observation => ({ kind: 'method' as const,
-        summary: `observation ${observation.id}: ${observation.execution?.sourcePaths?.join(', ') ?? ''} ${observation.summary.slice(0, 900)}`,
-        standing: observation.provenance === 'native_observation' ? 'supported' as const : 'needs_review' as const, sources: observation.supports })) : [];
-      if (pathQuery) items.push(...observationItems);
+
+      if (wantsEvidence) {
+        for (const observation of this.contextObservations(state, request.query).slice(0, 3)) {
+          items.push({ kind: 'method',
+            summary: `observation ${observation.id}: ${observation.execution?.sourcePaths?.join(', ') ?? ''} ${observation.summary.slice(0, 900)}`,
+            standing: observation.provenance === 'native_observation' ? 'supported' : 'needs_review',
+            sources: observation.supports.length ? observation.supports : [contentRef(observation.id, 1, observation)] });
+        }
+      }
       items.push(...docItems);
-      for (const claim of state.claims.filter(item => item.standing === 'supported').slice(0, 8)) {
-        items.push({ kind: 'architecture', summary: claim.statement, standing: claim.supports.some(support => this.staleSupport(support, current)) ? 'needs_review' : 'supported',
+
+      const supportedClaims = state.claims.filter(item => item.standing === 'supported');
+      const namedClaims = supportedClaims.filter(claim => query.includes(claim.id.toLowerCase()));
+      const claimsRequested = wantsKnowledge || (/\barchitecture\b/.test(query) && !docItems.some(item => item.kind === 'purpose'));
+      const claims = namedClaims.length ? namedClaims : claimsRequested ? supportedClaims.slice(-4) : [];
+      for (const claim of claims) {
+        items.push({ kind: 'architecture', summary: claim.statement,
+          standing: claim.supports.some(support => this.staleSupport(support, current)) ? 'needs_review' : 'supported',
           sources: claim.supports.length ? claim.supports : [contentRef(claim.id, 1, claim)] });
       }
-      if (state.claims.some(claim => ['candidate', 'needs_review'].includes(claim.standing))) gaps.push('Unresolved project knowledge remains. Inspect claims and query lookup by source path or claim ID for earlier native observations.');
-      if (index && !state.claims.some(item => item.standing === 'supported')) {
-        gaps.push('Understanding not synthesized yet: verify key files with prjct_search, then record purpose/pattern claims via prjct_knowledge propose with linked source ids.');
+      if (wantsKnowledge && state.claims.some(claim => ['candidate', 'needs_review'].includes(claim.standing))) {
+        gaps.push('Some requested project knowledge still needs review.');
       }
-      if (!pathQuery) items.push(...observationItems);
-      if (!state.works.length) gaps.push('No work selected; this is the project profile, not a work brief.');
-      const result = { status: gaps.length ? 'partial' as const : 'ok' as const, items, gaps, stateRevision: state.revision };
-      if (!work) return this.contextResult(request, result);
-      projectItems = items; projectGaps = gaps.filter(gap => !gap.startsWith('No work selected'));
+      const synthesized = docItems.some(item => item.kind === 'purpose' || item.kind === 'design') || supportedClaims.length > 0;
+      if (index && (wantsPurpose || wantsDesign || wantsKnowledge) && !synthesized) {
+        gaps.push('Understanding not synthesized yet: verify key files with prjct_search, then record supported purpose or pattern claims.');
+      }
+      projectItems = items;
+      projectGaps = gaps;
+    }
+    if (!work || !wantsWork) {
+      const gaps = [...projectGaps];
+      if (wantsWork && !work) gaps.push('No work is selected.');
+      if (!projectItems.length && !gaps.length) gaps.push('No retained context matched this query.');
+      const result = { status: projectItems.length ? (gaps.length ? 'partial' as const : 'ok' as const) : 'abstained' as const,
+        items: projectItems, gaps, stateRevision: state.revision };
+      return this.contextResult(request, result, MAX_CONTEXT_LOOKUP_BYTES);
     }
     const items: Array<{ kind: 'work' | 'method' | 'stack' | 'purpose' | 'architecture' | 'history' | 'design'; summary: string; standing: 'supported' | 'needs_review'; sources: Ref[] }> = [
       ...projectItems,
@@ -857,22 +917,24 @@ export class ProcessRuntime {
         standing: 'supported' as const, sources: [contentRef(work.id, 1, work)] },
     ];
     const open = state.tasks.filter(item => item.workId === work.id && !['completed', 'cancelled'].includes(item.disposition));
-    for (const task of open.filter(item => this.isBlocked(state, item).length === 0).slice(0, 8)) {
+    for (const task of open.filter(item => this.isBlocked(state, item).length === 0).slice(0, 4)) {
       items.push({ kind: 'work' as const, summary: `ready task ${task.id} (${task.disposition}): ${task.nextAction}`,
         standing: 'supported' as const, sources: [contentRef(task.id, 1, task)] });
     }
-    for (const task of open.filter(item => this.isBlocked(state, item).length > 0).slice(0, 8)) {
+    for (const task of open.filter(item => this.isBlocked(state, item).length > 0).slice(0, 2)) {
       items.push({ kind: 'work' as const,
         summary: `blocked task ${task.id} by ${this.isBlocked(state, task).map(item => item.id).join(', ')}`,
         standing: 'supported' as const, sources: [contentRef(task.id, 1, task)] });
     }
-    for (const entry of state.checkpoints.filter(entry => entry.workId === work.id).slice(-5)) {
-      items.push({ kind: 'method' as const, summary: `journal ${entry.id} (${entry.kind}): ${JSON.stringify(entry.data ?? {}).slice(0, 2800)} Next: ${entry.nextAction}`,
+    for (const entry of state.checkpoints.filter(entry => entry.workId === work.id).slice(-2)) {
+      items.push({ kind: 'method' as const, summary: `journal ${entry.id} (${entry.kind}): ${JSON.stringify(entry.data ?? {}).slice(0, 1200)} Next: ${entry.nextAction}`,
         standing: 'supported' as const, sources: [contentRef(entry.id, 1, entry)] });
     }
-    for (const observation of this.contextObservations(state, request.query, work.id)) {
-      items.push({ kind: 'work' as const, summary: `observation ${observation.id}: ${observation.execution?.sourcePaths?.join(', ') ?? ''} ${observation.summary.slice(0, 900)}`,
-        standing: 'supported' as const, sources: observation.supports.length ? observation.supports : [contentRef(observation.id, 1, observation)] });
+    if (wantsEvidence) {
+      for (const observation of this.contextObservations(state, request.query, work.id).slice(0, 3)) {
+        items.push({ kind: 'work' as const, summary: `observation ${observation.id}: ${observation.execution?.sourcePaths?.join(', ') ?? ''} ${observation.summary.slice(0, 900)}`,
+          standing: 'supported' as const, sources: observation.supports.length ? observation.supports : [contentRef(observation.id, 1, observation)] });
+      }
     }
     const gaps: string[] = [...projectGaps];
     const index = await this.loadManifest(this.keyOf(bound));
@@ -886,7 +948,7 @@ export class ProcessRuntime {
     if (!index) gaps.push('No applied index; ask for prjct_refresh when the task needs source lookup.');
     else if (index.manifestHash !== current.manifestHash) gaps.push('Sources changed since the last index; ask for prjct_refresh before trusting search.');
     const result = { status: gaps.length ? 'partial' as const : 'ok' as const, items, gaps, stateRevision: state.revision };
-    return this.contextResult(request, result);
+    return this.contextResult(request, result, MAX_CONTEXT_LOOKUP_BYTES);
   }
 
   private async work(params: Record<string, unknown>, signal?: AbortSignal) {
