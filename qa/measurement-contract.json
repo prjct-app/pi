@@ -1,0 +1,470 @@
+{
+  "schemaVersion": 1,
+  "contractId": "prjct-s0-measurement-v1",
+  "authority": {
+    "specification": {
+      "id": "plan_533ee5cd",
+      "revision": 1,
+      "contentHash": "3af01dca46d284cbd3e8a0aadb81c0d381a31d7ace2667054e6a36e15e16979e"
+    },
+    "plan": {
+      "id": "plan_a31c13e4",
+      "revision": 3,
+      "contentHash": "f7e406e88be5e0f871f8a77a314976643504a5ad0177b4c1affed199e4b2a27c"
+    },
+    "comparisonIdentities": {
+      "id": "art_f660843d",
+      "revision": 1,
+      "contentHash": "29dd23199504bd1404dbb1e3145ec32d8c666a690a238f7825768f7952e15d2c"
+    }
+  },
+  "baseGitSha": "6926e93e21549b2994a745520b6746d0070fbc1e",
+  "systems": [
+    {
+      "id": "bare_pi_0_85_1",
+      "packages": [
+        {
+          "name": "@earendil-works/pi-coding-agent",
+          "version": "0.85.1",
+          "source": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.85.1.tgz",
+          "sha1": "4cd00f653c3dabeb193b46f511044e7fbfe0f947",
+          "checksum": "sha512:FGRN+OHbWaefBPGaTggAdLjrIHW+s2PzLyglz/5dfLzb9of7uuXMXYC0fJIeZTw+shS32o2cuQ9jF7YSDuL/oQ=="
+        }
+      ],
+      "runtime": {
+        "node": "22.22.2",
+        "npm": "11.12.1",
+        "pi": "0.85.1",
+        "bun": "1.3.11"
+      },
+      "os": {
+        "platform": "darwin",
+        "release": "25.6.0",
+        "architecture": "arm64",
+        "version": "macOS 26.6.2",
+        "build": "25G83"
+      },
+      "configuration": {
+        "isolatedHome": true,
+        "network": "disabled",
+        "provider": "offline-fixture",
+        "modelPolicy": "identical-pinned-fixture",
+        "caseOrder": "qa/fixtures/cases.json order",
+        "environmentBudgets": "contract stopRules",
+        "optionalCompanionPackages": "none",
+        "packageSurfaces": "built-in Pi behavior only",
+        "extensions": "none",
+        "themes": "none",
+        "prompts": "none",
+        "skills": "none"
+      },
+      "command": {
+        "executable": "node",
+        "argv": [
+          "qa/run-paired-benchmark.mjs",
+          "--contract",
+          "qa/measurement-contract.json",
+          "--system",
+          "bare_pi_0_85_1",
+          "--cases",
+          "qa/fixtures/cases.json",
+          "--output",
+          "evidence/runs"
+        ]
+      }
+    },
+    {
+      "id": "legacy_prjct_cli_4_25_1",
+      "packages": [
+        {
+          "name": "prjct-cli",
+          "version": "4.25.1",
+          "source": "/Users/jj/Apps/prjct/prjct-cli#v4.25.1",
+          "gitTag": "v4.25.1",
+          "gitSha": "4a0db36713d7af7ae78d123df5a303f1d3d954cd"
+        }
+      ],
+      "runtime": {
+        "node": "22.22.2",
+        "npm": "11.12.1",
+        "pi": "0.85.1",
+        "bun": "1.3.11"
+      },
+      "os": {
+        "platform": "darwin",
+        "release": "25.6.0",
+        "architecture": "arm64",
+        "version": "macOS 26.6.2",
+        "build": "25G83"
+      },
+      "configuration": {
+        "isolatedHome": true,
+        "network": "disabled",
+        "provider": "offline-fixture",
+        "modelPolicy": "identical-pinned-fixture",
+        "caseOrder": "qa/fixtures/cases.json order",
+        "environmentBudgets": "contract stopRules",
+        "optionalCompanionPackages": "none",
+        "packageSurfaces": "complete prjct-cli repository behavior at the pinned clean commit",
+        "extensions": "package default",
+        "themes": "package default",
+        "prompts": "package default",
+        "skills": "package default"
+      },
+      "command": {
+        "executable": "node",
+        "argv": [
+          "qa/run-paired-benchmark.mjs",
+          "--contract",
+          "qa/measurement-contract.json",
+          "--system",
+          "legacy_prjct_cli_4_25_1",
+          "--cases",
+          "qa/fixtures/cases.json",
+          "--output",
+          "evidence/runs"
+        ]
+      }
+    },
+    {
+      "id": "native_prjct_0_2_0_baseline",
+      "packages": [
+        {
+          "name": "@earendil-works/pi-coding-agent",
+          "version": "0.85.1",
+          "source": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.85.1.tgz",
+          "sha1": "4cd00f653c3dabeb193b46f511044e7fbfe0f947",
+          "checksum": "sha512:FGRN+OHbWaefBPGaTggAdLjrIHW+s2PzLyglz/5dfLzb9of7uuXMXYC0fJIeZTw+shS32o2cuQ9jF7YSDuL/oQ=="
+        },
+        {
+          "name": "prjct",
+          "version": "0.2.0",
+          "source": "/Users/jj/Apps/prjct/pi",
+          "gitSha": "6926e93e21549b2994a745520b6746d0070fbc1e"
+        }
+      ],
+      "runtime": {
+        "node": "22.22.2",
+        "npm": "11.12.1",
+        "pi": "0.85.1",
+        "bun": "1.3.11"
+      },
+      "os": {
+        "platform": "darwin",
+        "release": "25.6.0",
+        "architecture": "arm64",
+        "version": "macOS 26.6.2",
+        "build": "25G83"
+      },
+      "configuration": {
+        "isolatedHome": true,
+        "network": "disabled",
+        "provider": "offline-fixture",
+        "modelPolicy": "identical-pinned-fixture",
+        "caseOrder": "qa/fixtures/cases.json order",
+        "environmentBudgets": "contract stopRules",
+        "optionalCompanionPackages": "none",
+        "packageSurfaces": "Pi plus native prjct only",
+        "extensions": "prjct@6926e93e21549b2994a745520b6746d0070fbc1e",
+        "themes": "none",
+        "prompts": "none",
+        "skills": "none",
+        "immutableBaseline": true
+      },
+      "command": {
+        "executable": "node",
+        "argv": [
+          "qa/run-paired-benchmark.mjs",
+          "--contract",
+          "qa/measurement-contract.json",
+          "--system",
+          "native_prjct_0_2_0_baseline",
+          "--cases",
+          "qa/fixtures/cases.json",
+          "--output",
+          "evidence/runs"
+        ]
+      }
+    },
+    {
+      "id": "gentle_pi_0_14_0_package",
+      "packages": [
+        {
+          "name": "@earendil-works/pi-coding-agent",
+          "version": "0.85.1",
+          "source": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.85.1.tgz",
+          "sha1": "4cd00f653c3dabeb193b46f511044e7fbfe0f947",
+          "checksum": "sha512:FGRN+OHbWaefBPGaTggAdLjrIHW+s2PzLyglz/5dfLzb9of7uuXMXYC0fJIeZTw+shS32o2cuQ9jF7YSDuL/oQ=="
+        },
+        {
+          "name": "gentle-pi",
+          "version": "0.14.0",
+          "source": "https://registry.npmjs.org/gentle-pi/-/gentle-pi-0.14.0.tgz",
+          "sha1": "d598ded4f60f5a1f38f2a751a4a2994cb811e31c",
+          "checksum": "sha512:azS1EpfRb3UaM9FR3tyxSzZOYs9BA94+d1Lcbit+Qm5aMvl4R7/rWLzHb6BIYv61H/sfxrFwSQCVGO47vfh88A=="
+        }
+      ],
+      "runtime": {
+        "node": "22.22.2",
+        "npm": "11.12.1",
+        "pi": "0.85.1",
+        "bun": "1.3.11"
+      },
+      "os": {
+        "platform": "darwin",
+        "release": "25.6.0",
+        "architecture": "arm64",
+        "version": "macOS 26.6.2",
+        "build": "25G83"
+      },
+      "configuration": {
+        "isolatedHome": true,
+        "network": "disabled",
+        "provider": "offline-fixture",
+        "modelPolicy": "identical-pinned-fixture",
+        "caseOrder": "qa/fixtures/cases.json order",
+        "environmentBudgets": "contract stopRules",
+        "optionalCompanionPackages": "none",
+        "packageSurfaces": "all shipped pi.extensions, pi.themes, pi.prompts, and pi.skills",
+        "extensions": "package default",
+        "themes": "package default",
+        "prompts": "package default",
+        "skills": "package default",
+        "packageLocalRuntime": "not used"
+      },
+      "command": {
+        "executable": "node",
+        "argv": [
+          "qa/run-paired-benchmark.mjs",
+          "--contract",
+          "qa/measurement-contract.json",
+          "--system",
+          "gentle_pi_0_14_0_package",
+          "--cases",
+          "qa/fixtures/cases.json",
+          "--output",
+          "evidence/runs"
+        ]
+      }
+    },
+    {
+      "id": "gentle_pi_2_5_0_full_runtime",
+      "packages": [
+        {
+          "name": "@earendil-works/pi-coding-agent",
+          "version": "0.85.1",
+          "source": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.85.1.tgz",
+          "sha1": "4cd00f653c3dabeb193b46f511044e7fbfe0f947",
+          "checksum": "sha512:FGRN+OHbWaefBPGaTggAdLjrIHW+s2PzLyglz/5dfLzb9of7uuXMXYC0fJIeZTw+shS32o2cuQ9jF7YSDuL/oQ=="
+        },
+        {
+          "name": "gentle-pi",
+          "version": "2.5.0",
+          "source": "https://registry.npmjs.org/gentle-pi/-/gentle-pi-2.5.0.tgz",
+          "sha1": "5176befd7bca90a4ca7a3628d6a6d8621796b003",
+          "checksum": "sha512:DJlSutLl1Nz9REx4BvNdI6iT66TElBlEmuD5qUDlCSpuhU5qhGhvNHlwRxiAkqFNZPLl+FcDQKvM3su89R4eMg=="
+        }
+      ],
+      "runtime": {
+        "node": "22.22.2",
+        "npm": "11.12.1",
+        "pi": "0.85.1",
+        "bun": "1.3.11"
+      },
+      "os": {
+        "platform": "darwin",
+        "release": "25.6.0",
+        "architecture": "arm64",
+        "version": "macOS 26.6.2",
+        "build": "25G83"
+      },
+      "configuration": {
+        "isolatedHome": true,
+        "network": "disabled",
+        "provider": "offline-fixture",
+        "modelPolicy": "identical-pinned-fixture",
+        "caseOrder": "qa/fixtures/cases.json order",
+        "environmentBudgets": "contract stopRules",
+        "optionalCompanionPackages": "none",
+        "packageSurfaces": "all shipped pi.extensions, pi.themes, pi.prompts, and pi.skills plus postinstall package-local runtime",
+        "extensions": "package default",
+        "themes": "package default",
+        "prompts": "package default",
+        "skills": "package default",
+        "packageLocalRuntime": "required and digest-pinned in each run manifest",
+        "preProvisionedBeforeOfflineRun": true
+      },
+      "command": {
+        "executable": "node",
+        "argv": [
+          "qa/run-paired-benchmark.mjs",
+          "--contract",
+          "qa/measurement-contract.json",
+          "--system",
+          "gentle_pi_2_5_0_full_runtime",
+          "--cases",
+          "qa/fixtures/cases.json",
+          "--output",
+          "evidence/runs"
+        ]
+      }
+    }
+  ],
+  "resultSchema": {
+    "measurements": [
+      "inputTokens",
+      "outputTokens",
+      "cacheReadTokens",
+      "cacheWriteTokens",
+      "wallTimeMs",
+      "contextBytes",
+      "exitStatus"
+    ],
+    "availabilityEncoding": {
+      "available": "available",
+      "unavailable": "unavailable"
+    },
+    "unavailableReasons": [
+      "provider_not_reported",
+      "not_applicable",
+      "process_terminated",
+      "measurement_failed",
+      "grader_failed_before_measurement"
+    ],
+    "recordRule": "Every measurement is an object with status=available and a finite numeric value, or status=unavailable and one declared reason. Null, omission, and implicit zero are invalid.",
+    "graderVerdict": {
+      "available": {
+        "status": "available",
+        "passed": "boolean",
+        "score": "finite number"
+      },
+      "unavailable": {
+        "status": "unavailable",
+        "reason": "declared unavailable reason"
+      },
+      "rule": "A completed valid attempt records the hidden grader pass verdict and score. A process or grading failure records an explicit unavailable reason."
+    }
+  },
+  "failureTaxonomy": [
+    {
+      "id": "success",
+      "definition": "The process exited zero, output parsed, and the hidden grader returned a valid passing or failing score.",
+      "inDenominator": true
+    },
+    {
+      "id": "timeout",
+      "definition": "The per-attempt wall-time limit elapsed before process completion.",
+      "inDenominator": true
+    },
+    {
+      "id": "crash",
+      "definition": "The process exited non-zero, received a signal, failed to start, or terminated without a more specific declared classification.",
+      "inDenominator": true
+    },
+    {
+      "id": "refusal",
+      "definition": "The output explicitly declined the requested task and the refusal classifier produced a valid verdict.",
+      "inDenominator": true
+    },
+    {
+      "id": "invalid_output",
+      "definition": "The process completed but its output was missing, malformed, duplicated, or failed the declared output schema.",
+      "inDenominator": true
+    },
+    {
+      "id": "grader_failure",
+      "definition": "The hidden grader crashed, timed out, returned malformed output, or could not produce a verdict.",
+      "inDenominator": true
+    }
+  ],
+  "accounting": {
+    "denominator": "all_attempted_records",
+    "appendBeforeExecution": true,
+    "dropFailures": false,
+    "maxAttemptsPerSystemCase": 1,
+    "attemptIdentity": [
+      "runId",
+      "systemId",
+      "caseId",
+      "attemptNumber"
+    ],
+    "rule": "Persist the attempt identity and start timestamp before spawning Pi. Finalize that same record for every outcome. Aggregation must reject missing or duplicate scheduled pairs; filters may not alter failure denominators."
+  },
+  "stopRules": {
+    "perAttemptTimeoutMs": 120000,
+    "terminationGraceMs": 5000,
+    "retainCurrentAttempt": true,
+    "listEveryUnattemptedPair": true,
+    "allowedRunStopReasons": [
+      "contract_invalid",
+      "fixture_checksum_mismatch",
+      "grader_checksum_mismatch",
+      "insufficient_disk",
+      "operator_interrupt"
+    ],
+    "minimumFreeDiskBytes": 1073741824,
+    "rule": "No automatic retry is permitted. A run-level stop finalizes any started attempt, records the stop reason, and enumerates every scheduled but unattempted system/case pair."
+  },
+  "statistics": {
+    "referenceSystemId": "bare_pi_0_85_1",
+    "pairingKey": "caseId",
+    "failureOutcomeDenominator": "all_attempted_pairs",
+    "unavailableMetricPolicy": "no_imputation_report_counts",
+    "outcome": {
+      "measure": "hidden grader passed; every non-success attempt contributes false",
+      "summaries": [
+        "paired_success_delta",
+        "discordant_pair_counts",
+        "exact_two_sided_mcnemar_p"
+      ]
+    },
+    "continuousMeasurements": [
+      "inputTokens",
+      "outputTokens",
+      "cacheReadTokens",
+      "cacheWriteTokens",
+      "wallTimeMs",
+      "contextBytes"
+    ],
+    "continuousSummaries": [
+      "paired_count",
+      "unavailable_count_by_reason",
+      "median_paired_delta",
+      "median_absolute_deviation",
+      "p05_paired_delta",
+      "p95_paired_delta"
+    ],
+    "eligibilityRule": "Outcome statistics include every attempted reference/candidate pair. Continuous statistics use only pairs where both values are available; excluded counts and reasons are reported and values are never imputed."
+  },
+  "perRunIdentitySchema": {
+    "requiredFields": [
+      "contractSha256",
+      "caseCorpusSha256",
+      "graderSha256",
+      "systemId",
+      "packageArtifactChecksums",
+      "installedRuntimeExecutableSha256",
+      "providerContractSha256",
+      "nodeVersion",
+      "npmVersion",
+      "piVersion",
+      "bunVersion",
+      "osPlatform",
+      "osRelease",
+      "osArchitecture",
+      "osVersion",
+      "osBuild",
+      "configuration",
+      "exactCommand"
+    ],
+    "rule": "Capture observed values before the first attempt. A missing installed runtime or provider field is an invalid run, not an unavailable usage measurement."
+  },
+  "failureClassificationPrecedence": [
+    "timeout",
+    "crash",
+    "invalid_output",
+    "grader_failure",
+    "refusal",
+    "success"
+  ]
+}
