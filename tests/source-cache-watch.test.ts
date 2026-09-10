@@ -107,6 +107,37 @@ test('a coalesced child event removes its deleted directory subtree', async t =>
   assert.deepEqual(internals.assemble('watch').hashes, Object.create(null));
 });
 
+test('a fresh live snapshot catches a deletion before its watcher event is delivered', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'prjct-watch-late-event-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, 'src'), { recursive: true });
+  await writeFile(join(root, 'src/stale.ts'), 'export const stale = true;\n');
+  const cache = new SourceCache(root);
+  const counter = countWalks(cache);
+  t.after(counter.restore);
+  await cache.snapshot({ fresh: true });
+
+  // Reproduce the state seen under concurrent load: the filesystem operation
+  // has completed, but FSEvents has not populated dirtyPaths yet.
+  const internals = cache as unknown as {
+    watcher: { close(): void };
+    walkedSinceWatch: boolean;
+    needsFullWalk: boolean;
+  };
+  internals.watcher = { close() {} };
+  internals.walkedSinceWatch = true;
+  internals.needsFullWalk = false;
+  try {
+    assert.equal(cache.live, true);
+    await unlink(join(root, 'src/stale.ts'));
+    const snapshot = await cache.snapshot({ fresh: true });
+    assert.equal(snapshot.hashes['src/stale.ts'], undefined);
+    assert.equal(counter.walks(), 1, 'late-event recovery does not require another full walk');
+  } finally {
+    cache.unwatch();
+  }
+});
+
 test('PRJCT_WATCH=0 keeps the walk-only behaviour', async t => {
   const root = await mkdtemp(join(tmpdir(), 'prjct-nowatch-'));
   t.after(() => rm(root, { recursive: true, force: true }));
