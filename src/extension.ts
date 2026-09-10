@@ -34,7 +34,9 @@ const SUBCOMMANDS = ['init', 'sync', 'status', 'run', 'analyze', 'export', 'work
 export default function prjctExtension(pi: ExtensionAPI) {
   let attempt = newId('attempt');
   const runtimes = new Map<string, ProcessRuntime>();
-  const runners = new Map<string, JobRunner>();
+  // The runner persists per project, but its model selection follows the
+  // current session. Services snapshot it only when each model job starts.
+  const runners = new Map<string, { runner: JobRunner; selection: { model: string | undefined } }>();
   const runtime = (cwd: string, sessionId = attempt) => {
     const key = `${sessionId}:${cwd}`;
     let owner = runtimes.get(key);
@@ -68,11 +70,16 @@ export default function prjctExtension(pi: ExtensionAPI) {
   const runnerFor = async (owner: ProcessRuntime, ctx: Pick<ExtensionContext, 'hasUI' | 'ui' | 'model' | 'mode'>): Promise<JobRunner | undefined> => {
     const path = await owner.jobsPath();
     if (!path) return undefined;
-    let runner = runners.get(path);
-    if (runner) return runner;
-    // Model services always use the session's model (provider/id), thinking low.
+    // Model services always use the session's current model (provider/id),
+    // including after the user switches model while this runner is cached.
     const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-    const services = createServices(owner, { extensionPath, ...(model ? { model } : {}) });
+    const existing = runners.get(path);
+    if (existing) {
+      existing.selection.model = model;
+      return existing.runner;
+    }
+    const selection: { model: string | undefined } = { model };
+    const services = createServices(owner, { extensionPath, selectModel: () => selection.model });
     const status = (text: string | undefined) => { if (ctx.hasUI) ctx.ui.setStatus('prjct', text); };
     let lastProgress = 0;
     const lastRun = new Map<string, { summary: string; durationMs: number }>();
@@ -107,12 +114,12 @@ export default function prjctExtension(pi: ExtensionAPI) {
         }
       }
     };
-    runner = new JobRunner({ path, services, onEvent });
-    runners.set(path, runner);
+    const runner = new JobRunner({ path, services, onEvent });
+    runners.set(path, { runner, selection });
     return runner;
   };
   const stopRunners = async () => {
-    await Promise.allSettled([...runners.values()].map(runner => runner.stop()));
+    await Promise.allSettled([...runners.values()].map(slot => slot.runner.stop()));
     runners.clear();
   };
 
