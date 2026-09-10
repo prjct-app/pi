@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readdir, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from './test-paths.ts';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -45,6 +45,39 @@ test('a leftover temporary file is not treated as the published record', async (
     assert.deepEqual(published?.payload, { ok: true });
     assert.equal(published?.contentHash.length, 64);
     assert.equal((await readdir(root)).includes('state.json.tmp'), true); // Preserve pre-existing recovery evidence.
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a trusted publication root rejects symlinked descendant directories', { skip: process.platform === 'win32' }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'prjct-store-symlink-'));
+  try {
+    const trusted = join(root, 'work');
+    const outside = join(root, 'outside');
+    await Promise.all([mkdir(trusted), mkdir(outside)]);
+    await symlink(outside, join(trusted, 'sessions'), 'dir');
+    await assert.rejects(() => publishRecord(join(trusted, 'sessions', '20260909', 'writer.json'), {
+      expectedRevision: 0, payload: { escaped: true }, directoryRoot: trusted,
+    }), { code: 'UNSAFE_SYMLINK' });
+    assert.deepEqual(await readdir(outside), []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a trusted publication root rejects a symlinked revisions directory', { skip: process.platform === 'win32' }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'prjct-store-revisions-symlink-'));
+  try {
+    const trusted = join(root, 'work');
+    const outside = join(root, 'outside');
+    const recordDirectory = join(trusted, 'sessions', '20260909');
+    await Promise.all([mkdir(recordDirectory, { recursive: true }), mkdir(outside)]);
+    await symlink(outside, join(recordDirectory, 'revisions'), 'dir');
+    await assert.rejects(() => publishRecord(join(recordDirectory, 'writer.json'), {
+      expectedRevision: 0, payload: { escaped: true }, directoryRoot: trusted,
+    }), { code: 'UNSAFE_SYMLINK' });
+    assert.deepEqual(await readdir(outside), []);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

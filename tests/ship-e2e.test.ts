@@ -35,9 +35,10 @@ test('ship end-to-end: red-green-verified work closes; unverified work is refuse
     let text: string; let outcome: 'succeeded' | 'failed';
     try { text = JSON.stringify(await createBashTool(cwd).execute(label, { command })); outcome = 'succeeded'; }
     catch (error) { text = String((error as Error).message ?? error); outcome = 'failed'; }
-    await runtime.recordObservation(`bash ${label}: ${text.slice(0, 1500)}`,
+    const observationId = await runtime.recordObservation(`bash ${label}: ${text.slice(0, 1500)}`,
       { toolCallId: label, toolName: 'bash', command, outcome, beforeHash });
-    return (await stateDoc()).observations.at(-1)!.id;
+    assert.ok(observationId);
+    return observationId;
   };
   const confirm = async () => true;
 
@@ -56,8 +57,10 @@ test('ship end-to-end: red-green-verified work closes; unverified work is refuse
   // TDD: seam confirmed by user, failing test authored and observed red.
   const seamObs = await bash('true', 'noop'); // placeholder replaced by user evidence below
   void seamObs;
-  await runtime.recordObservation('user_input: seam is reserveSeat boundary behavior', { toolCallId: 'u1', toolName: 'user_input', outcome: 'succeeded' });
-  const userObs = (await stateDoc()).observations.at(-1)!.id;
+  const userObs = await runtime.recordObservation('user_input: seam is reserveSeat boundary behavior', {
+    toolCallId: 'u1', toolName: 'user_input', outcome: 'succeeded',
+  });
+  assert.ok(userObs);
   const progress = async (stage: string, evidenceIds: string[]) =>
     runtime.execute('prjct_checkpoint', { action: 'record', kind: 'progress', workId, taskId: 'task_fix', methodId: 'tdd', stage,
       summary: stage, evidenceIds, nextAction: 'next', ...await mutation() }, { confirm });

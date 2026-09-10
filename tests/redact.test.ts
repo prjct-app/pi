@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtemp, mkdir, rm, writeFile, readFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, rm, writeFile, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from './test-paths.ts';
 import { redactSecrets, containsSecretShape } from '../src/knowledge/redact.ts';
 import { ProcessRuntime } from '../src/pi/process-runtime.ts';
-import { readRecord } from '../src/workspace/store.ts';
+import { sha256 } from '../src/workspace/ids.ts';
 
 test('secret shapes are redacted, diagnostic signal survives', () => {
   const input = [
@@ -37,13 +37,18 @@ test('persisted observations never contain secret material, from any host path',
   await writeFile(join(cwd, 'README.md'), '# redaction fixture\n');
   const runtime = new ProcessRuntime({ cwd, agentHome, prjctHome, sessionId: 's', attemptId: 'a' });
   await runtime.initProject();
-  await runtime.recordObservation('bash failed: export STRIPE_SECRET_KEY=sk-live-abc123456789 && curl failed with 401', {
+  const observationId = await runtime.recordObservation('bash failed: export STRIPE_SECRET_KEY=sk-live-abc123456789 && curl failed with 401', {
     toolCallId: 't1', toolName: 'bash', command: 'export STRIPE_SECRET_KEY=sk-live-abc123456789 && curl https://api.stripe.com', outcome: 'failed',
   });
+  assert.ok(observationId);
   const id = await runtime.identity();
-  const state = (await readRecord(join(prjctHome, id.day, id.projectId, 'work/state.json')))!.payload as { observations: Array<{ summary: string; execution?: { command?: string } }> };
-  const raw = await readFile(join(prjctHome, id.day, id.projectId, 'work/state.json'), 'utf8');
+  const observations = await runtime.readObservations();
+  const sessionDirectory = join(prjctHome, id.day, id.projectId, 'work', 'sessions', observations[0]!.recordedDay!,
+    `session_${sha256('s').slice(0, 16)}`);
+  const journals = (await readdir(sessionDirectory)).filter(file => /^writer_[a-f0-9]{16}\.json$/.test(file));
+  assert.equal(journals.length, 1);
+  const raw = await readFile(join(sessionDirectory, journals[0]!), 'utf8');
   assert.ok(!raw.includes('sk-live-abc123456789'), 'secret must not reach disk in summary or command');
-  assert.match(state.observations[0]!.summary, /401/);
-  assert.match(state.observations[0]!.summary, /<REDACTED>/);
+  assert.match(observations[0]!.summary, /401/);
+  assert.match(observations[0]!.summary, /<REDACTED>/);
 });

@@ -59,15 +59,17 @@ test('I-1: errors carry the expected checkoutId and current revision', async () 
   }
 });
 
-test('I-2: observations are capped instead of growing unbounded', async () => {
-  const { root, checkout, runtime, ids, prjctHome } = await setup();
+test('I-2: observations are capped without reading older unreferenced day buckets', async () => {
+  const { root, runtime, ids, prjctHome } = await setup();
   try {
     await runtime.initProject();
     await runtime.syncProject();
     for (let index = 0; index < 205; index += 1) await runtime.recordObservation(`bash completed: step ${index}`);
     const { key } = await ids();
-    const state = (await readRecord(join(scopeStore(prjctHome, key, 'work'), 'state.json')))!;
-    const observations = (state.payload as { observations: Array<{ summary: string }> }).observations;
+    const oldSession = join(scopeStore(prjctHome, key, 'work'), 'sessions', '00000000', 'session_0000000000000000');
+    await mkdir(oldSession, { recursive: true });
+    await writeFile(join(oldSession, 'writer_0000000000000000.json'), '{corrupt old journal');
+    const observations = await runtime.readObservations();
     assert.equal(observations.length, 200);
     assert.match(observations[observations.length - 1]!.summary, /step 204/);
   } finally {
@@ -92,7 +94,7 @@ test('I-3: a file declaring the exact symbol outranks BM25 ties and discloses wh
 });
 
 test('I-7: ship refuses when assessment evidence predates a source change', async () => {
-  const { root, checkout, runtime, ids, rev, prjctHome } = await setup();
+  const { root, checkout, runtime, ids, rev } = await setup();
   try {
     await runtime.initProject();
     await runtime.syncProject();
@@ -101,9 +103,7 @@ test('I-7: ship refuses when assessment evidence predates a source change', asyn
     await runtime.execute('prjct_task', { action: 'define', workId, definition, criterionIds: ['c1'], operationId: 'op_d', expectedRevision: await rev(), taskId: 't1', maxBytes: 4096 });
     const { checkoutId } = await ids();
     await runtime.execute('prjct_task', { action: 'claim', workId, taskId: 't1', checkoutId, access: 'write', operationId: 'op_c', expectedRevision: await rev(), maxBytes: 4096 }, { confirm: async () => true });
-    await observeNative(runtime);
-    const state = (await readRecord(join(scopeStore(prjctHome, (await ids()).key, 'work'), 'state.json')))!;
-    const obsId = (state.payload as { observations: Array<{ id: string }> }).observations[0]!.id;
+    const obsId = await observeNative(runtime);
     const assessment = await runtime.execute('prjct_checkpoint', {
       action: 'record', workId, taskId: 't1', kind: 'assessment', planRevision: 0, definitionRevision: 1,
       judgments: [{ criterionId: 'c1', conclusion: 'satisfied', evidenceIds: [obsId], rationale: 'pass' }],
@@ -124,7 +124,7 @@ test('I-7: ship refuses when assessment evidence predates a source change', asyn
 });
 
 test('I-7b: ship refuses after sources change post-assessment', async () => {
-  const { root, checkout, runtime, ids, rev, prjctHome } = await setup();
+  const { root, checkout, runtime, ids, rev } = await setup();
   try {
     await runtime.initProject();
     await runtime.syncProject();
@@ -133,9 +133,7 @@ test('I-7b: ship refuses after sources change post-assessment', async () => {
     await runtime.execute('prjct_task', { action: 'define', workId, definition, criterionIds: ['c1'], operationId: 'op_d', expectedRevision: await rev(), taskId: 't1', maxBytes: 4096 });
     const { checkoutId } = await ids();
     await runtime.execute('prjct_task', { action: 'claim', workId, taskId: 't1', checkoutId, access: 'write', operationId: 'op_c', expectedRevision: await rev(), maxBytes: 4096 }, { confirm: async () => true });
-    await observeNative(runtime);
-    const state = (await readRecord(join(scopeStore(prjctHome, (await ids()).key, 'work'), 'state.json')))!;
-    const obsId = (state.payload as { observations: Array<{ id: string }> }).observations[0]!.id;
+    const obsId = await observeNative(runtime);
     const assessment = await runtime.execute('prjct_checkpoint', {
       action: 'record', workId, taskId: 't1', kind: 'assessment', planRevision: 0, definitionRevision: 1,
       judgments: [{ criterionId: 'c1', conclusion: 'satisfied', evidenceIds: [obsId], rationale: 'pass' }],

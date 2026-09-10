@@ -57,8 +57,7 @@ test('continue takes over a named predecessor with recorded observations; the ol
 
     const continued = await two.execute('prjct_reconcile', {
       action: 'continue', workId, taskId: 'task_a', predecessorAttemptId: 'attempt_one',
-      observationIds: (await readRecord(join(scopeStore(prjctHome, (await ids()).key, 'work'), 'state.json')))!
-        .payload && ((await readRecord(join(scopeStore(prjctHome, (await ids()).key, 'work'), 'state.json')))!.payload as { observations: Array<{ id: string }> }).observations.map(o => o.id),
+      observationIds: (await one.readObservations()).map(observation => observation.id),
       operationId: 'op_k2', expectedRevision: await rev(), maxBytes: 4096,
     }, { confirm: async () => true });
     assert.equal((continued.details as { status: string }).status, 'ok');

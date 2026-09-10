@@ -27,10 +27,10 @@ const setup = async (t: TestContext) => {
   const identity = await runtime.identity();
   const statePath = join(prjctHome, identity.day, identity.projectId, 'work/state.json');
   const record = async () => (await readRecord(statePath))!;
-  const state = async () => (await record()).payload as {
-    selectedWorkId: string;
-    observations: Array<{ id: string; verification?: boolean; execution?: { command?: string } }>;
-  };
+  const state = async () => ({
+    ...((await record()).payload as { selectedWorkId: string }),
+    observations: [...await runtime.readObservations()],
+  });
   const workId = (await state()).selectedWorkId;
   const mutation = async () => ({ operationId: newId('op'), expectedRevision: (await record()).revision, maxBytes: 8192 });
   await runtime.execute('prjct_task', { action: 'define', workId, taskId: 'task_pair',
@@ -49,14 +49,20 @@ const setup = async (t: TestContext) => {
       error => ({ outcome: 'failed' as const, summary: String(error) }),
     );
     assert.equal(execution.outcome, exitCode === 0 ? 'succeeded' : 'failed', 'The fixture must actually execute with the intended outcome');
-    await runtime.recordObservation(execution.summary, { toolName: 'bash', toolCallId, command, beforeHash, outcome: execution.outcome });
-    return (await state()).observations.at(-1)!.id;
+    const observationId = await runtime.recordObservation(execution.summary, {
+      toolName: 'bash', toolCallId, command, beforeHash, outcome: execution.outcome,
+    });
+    assert.ok(observationId);
+    return observationId;
   };
   const prepareGreen = async (methodId: 'tdd' | 'diagnosing-bugs', redId: string) => {
     if (methodId === 'tdd') {
       // Scripted host input for this fixture; not a model-provided approval.
-      await runtime.recordObservation('Fixture user confirms the public seam', { toolName: 'user_input', toolCallId: newId('input'), outcome: 'succeeded' });
-      await progress(methodId, 'seam_confirmed', [(await state()).observations.at(-1)!.id]);
+      const confirmationId = await runtime.recordObservation('Fixture user confirms the public seam', {
+        toolName: 'user_input', toolCallId: newId('input'), outcome: 'succeeded',
+      });
+      assert.ok(confirmationId);
+      await progress(methodId, 'seam_confirmed', [confirmationId]);
       await progress(methodId, 'test_authored');
       await progress(methodId, 'red_observed', [redId]);
       await progress(methodId, 'green_pending');
@@ -143,6 +149,20 @@ test('diagnosis can pair matching redacted commands without retaining their orig
   const green = await fixture.run(command, 0);
   await fixture.progress('diagnosing-bugs', 'fixed', [green]);
   assert.doesNotMatch(await readFile(fixture.statePath, 'utf8'), /fixture_private/);
+});
+
+test('journal verification order uses a writer-local sequence instead of wall-clock or traversal order', () => {
+  const row = (id: string, outcome: 'failed' | 'succeeded', sessionSequence: number,
+    extra: Partial<VerificationObservation> = {}): VerificationObservation => ({
+    id, provenance: 'native_observation', workId: 'work_a', taskId: 'task_a', attemptId: 'attempt_a',
+    sessionId: 'session_a', checkoutId: 'checkout_a', journalWriterId: 'writer_a', sessionSequence, commandIdentity: 'command_a',
+    verificationSubstrate: 'substrate_a', execution: { toolCallId: `call_${id}`, toolName: 'bash', outcome }, ...extra,
+  });
+  const red = row('red', 'failed', 1);
+  const green = row('green', 'succeeded', 2);
+  assert.equal(hasVerificationPair([green, red], ['red'], ['green']), true, 'clock-sorted rows cannot invert writer order');
+  assert.equal(hasVerificationPair([row('late_red', 'failed', 2), row('early_green', 'succeeded', 1)], ['late_red'], ['early_green']), false);
+  assert.equal(hasVerificationPair([red, row('other_green', 'succeeded', 2, { journalWriterId: 'writer_b' })], ['red'], ['other_green']), false);
 });
 
 test('the pure pairing gate fails closed for legacy, cross-scope, and reused-call observations', () => {

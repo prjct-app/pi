@@ -1,5 +1,5 @@
-import { link, mkdir, open, readFile, rename, stat, unlink } from 'node:fs/promises';
-import { basename, dirname, join } from 'node:path';
+import { link, lstat, mkdir, open, readFile, rename, stat, unlink } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { newId, sha256 } from './ids.ts';
 
 export type StoreRecord = Readonly<{ revision: number; payload: unknown; contentHash: string }>;
@@ -57,7 +57,11 @@ export const readRevision = async (path: string, revision: number): Promise<Stor
 // the file only; used for high-frequency evidence appends where losing the last
 // entry on power loss is acceptable but corruption is not.
 export type Durability = 'full' | 'light';
-export type PublishRequest = Readonly<{ expectedRevision: number; payload: unknown; signal?: AbortSignal; durability?: Durability }>;
+export type PublishRequest = Readonly<{
+  expectedRevision: number; payload: unknown; signal?: AbortSignal; durability?: Durability;
+  /** Existing trusted ancestor below which every created component must be a real directory. */
+  directoryRoot?: string;
+}>;
 
 const STORE_LOCK_STALE_MS = 30_000;
 const processAlive = (pid: number): boolean => {
@@ -172,10 +176,34 @@ export const publishImmutableFile = async (path: string, content: string, signal
   await syncDirectory(path);
 };
 
+const ensureRealDirectoryPath = async (root: string, target: string): Promise<void> => {
+  const anchor = resolve(root);
+  const destination = resolve(target);
+  const suffix = relative(anchor, destination);
+  if (suffix === '..' || suffix.startsWith(`..${sep}`) || isAbsolute(suffix)) {
+    fail('PROHIBITED_PATH', 'Store publication escaped its trusted directory root.');
+  }
+  const verifyDirectory = async (path: string) => {
+    const info = await lstat(path);
+    if (info.isSymbolicLink()) fail('UNSAFE_SYMLINK', 'Store publication cannot traverse a symbolic-link directory.');
+    if (!info.isDirectory()) fail('PROHIBITED_PATH', 'Store publication requires real directory components.');
+  };
+  await verifyDirectory(anchor);
+  let current = anchor;
+  for (const part of suffix.split(sep).filter(Boolean)) {
+    current = join(current, part);
+    await mkdir(current).catch(error => {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    });
+    await verifyDirectory(current);
+  }
+};
+
 export const publishRecord = async (path: string, request: PublishRequest): Promise<StoreRecord> => {
   request.signal?.throwIfAborted();
   const durability = request.durability ?? 'full';
-  await mkdir(dirname(path), { recursive: true });
+  if (request.directoryRoot) await ensureRealDirectoryPath(request.directoryRoot, dirname(path));
+  else await mkdir(dirname(path), { recursive: true });
   const lock = await acquireStoreLock(path);
   try {
     const current = await readRecord(path);
@@ -189,6 +217,7 @@ export const publishRecord = async (path: string, request: PublishRequest): Prom
     // Serialized once; parseRecord re-derives the hash from the parsed payload.
     const envelope = `{"schemaVersion":1,"revision":${nextRevision},"contentHash":"${contentHash}","payload":${payloadJson}}`;
     const historyPath = join(dirname(path), 'revisions', basename(path), `${nextRevision}.json`);
+    if (request.directoryRoot) await ensureRealDirectoryPath(request.directoryRoot, dirname(historyPath));
     const previousHistory = await readRecord(historyPath);
     if (previousHistory && (previousHistory.contentHash !== contentHash || previousHistory.revision !== nextRevision)) {
       fail('HISTORY_CONFLICT', 'An interrupted publication owns this revision; explicit recovery is required.');

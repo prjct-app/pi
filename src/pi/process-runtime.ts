@@ -57,9 +57,12 @@ type GrantRow = { attemptId: string; generation: number; standing: 'valid' | 'un
 type EdgeRow = { from: string; to: string; relation: string };
 export type HostExecution = { toolCallId: string; toolName: string; command?: string; outcome: 'succeeded' | 'failed' | 'unknown'; beforeHash?: string;
   coverage?: 'exact' | 'partial' | 'unknown'; sourcePaths?: string[] };
-type ObservationRow = { id: string; provenance: 'native_observation' | 'agent_report'; summary: string; supports: Ref[];
+export type ObservationRecord = { id: string; provenance: 'native_observation' | 'agent_report'; summary: string; supports: Ref[];
   attemptId?: string; sessionId?: string; checkoutId?: string; workId?: string; taskId?: string; execution?: HostExecution;
-  verification?: boolean; commandIdentity?: string; verificationSubstrate?: string };
+  verification?: boolean; commandIdentity?: string; verificationSubstrate?: string;
+  actorId?: string; journalWriterId?: string; recordedDay?: string; recordedAt?: string; sessionSequence?: number };
+type ObservationRow = ObservationRecord;
+const persistedObservations = Symbol('persistedObservations');
 type Document = { projectId: string; checkoutId: string; location: string; day: string; revision: number;
   works: WorkRow[]; tasks: TaskRow[]; claims: ClaimRow[]; artifacts: ArtifactRow[];
   checkpoints: CheckpointRow[]; plans: PlanRow[]; selectedWorkId: string | null; selections?: Record<string, string | null>;
@@ -68,6 +71,7 @@ type Document = { projectId: string; checkoutId: string; location: string; day: 
   exportIntents?: Array<{ revision: Ref; description: string; operationId: string }>;
   operations: Record<string, { actorId: string; requestHash: string; receipt: Ref; result?: ToolResult }>;
   refresh?: { revision: number; configRevision: number; components: Array<{ id: string; appliedRevision?: number; appliedConfigRevision?: number; lastAttempt: 'not_run' | 'succeeded' | 'failed' | 'cancelled' }> };
+  [persistedObservations]?: ObservationRow[];
 };
 
 export type ToolResult = { content: Array<{ type: 'text'; text: string }>; details: unknown };
@@ -129,12 +133,14 @@ export class ProcessRuntime {
   readonly prjctRoot: string;
   readonly attemptId: string;
   readonly sessionId: string;
+  private readonly journalWriterId: string;
   private selection: string | null | undefined;
   private sourceCache: SourceCache | undefined;
   private identityPromise: Promise<IdentityResolution> | undefined;
   private currentCache: { generation: number; current: CurrentSources } | undefined;
   private walkShare = new AsyncLocalStorage<{ snapshot?: Promise<SourceSnapshot> }>();
   private indexCache: { manifestHash: string; index: ProjectIndex } | undefined;
+  private observationSequence = 0;
   private transaction = new AsyncLocalStorage<{ params: Record<string, unknown>; hash: string; pending?: Document; baseRevision?: number;
     files?: Array<{ path: string; content: string }>; records?: Array<{ path: string; expectedRevision: number; payload: unknown }>;
     confirm?: (message: string) => Promise<boolean> }>();
@@ -144,6 +150,7 @@ export class ProcessRuntime {
     this.actorId = options.actorId ?? 'actor_session';
     this.attemptId = options.attemptId ?? newId('attempt');
     this.sessionId = options.sessionId ?? this.attemptId;
+    this.journalWriterId = `writer_${sha256(`${this.sessionId}\0${this.attemptId}\0${newId('runtime')}`).slice(0, 16)}`;
     this.prjctRoot = options.prjctHome ?? process.env.PRJCT_HOME ?? join(homedir(), '.prjct');
   }
 
@@ -296,7 +303,7 @@ export class ProcessRuntime {
         }
         const prior = pending.operations[operationId]!;
         pending.operations[operationId] = { ...prior, requestHash, result };
-        await publishRecord(this.statePath(this.keyOf(pending)), { expectedRevision: frame.baseRevision!, payload: pending, ...(extras.signal ? { signal: extras.signal } : {}) });
+        await publishRecord(this.statePath(this.keyOf(pending)), { expectedRevision: frame.baseRevision!, payload: this.persistableDocument(pending), ...(extras.signal ? { signal: extras.signal } : {}) });
       }
       return result;
     }).catch(error => { this.selection = previousSelection; throw error; });
@@ -319,6 +326,14 @@ export class ProcessRuntime {
 
   private locatorPath() { return join(this.prjctRoot, 'identity', 'index.json'); }
   private statePath(key: string) { return join(scopeStore(this.prjctRoot, key, 'work'), 'state.json'); }
+  private workRootPath(key: string) { return scopeStore(this.prjctRoot, key, 'work'); }
+  private sessionRootPath(key: string) { return join(this.workRootPath(key), 'sessions'); }
+  private sessionDirectory(key: string, day = dayToday()) {
+    return join(this.sessionRootPath(key), day, `session_${sha256(this.sessionId).slice(0, 16)}`);
+  }
+  private journalPath(key: string, day = dayToday()) {
+    return join(this.sessionDirectory(key, day), `${this.journalWriterId}.json`);
+  }
   private representationPartPath(key: string, part: 'manifest' | 'lexical' | 'graph') {
     return join(scopeStore(this.prjctRoot, key, 'representation'), `${part}.json`);
   }
@@ -727,16 +742,91 @@ export class ProcessRuntime {
   /** Full walk in the background (agent idle): bounds what a missed watcher event could hide. */
   async revalidateSources(): Promise<void> { await (await this.sources()).revalidate(); }
 
-  private async load(key: string): Promise<Document> {
+  private async journalObservations(key: string, referencedIds: ReadonlySet<string>): Promise<ObservationRow[]> {
+    const root = this.sessionRootPath(key);
+    const rows: ObservationRow[] = [];
+    const seenIds = new Set<string>();
+    const missingReferences = new Set(referencedIds);
+    const days = await readdir(root, { withFileTypes: true }).catch(error => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw error;
+    });
+    for (const day of days.filter(entry => entry.isDirectory() && /^\d{8}$/.test(entry.name)).sort((a, b) => b.name.localeCompare(a.name))) {
+      const dayPath = join(root, day.name);
+      const sessions = await readdir(dayPath, { withFileTypes: true });
+      for (const session of sessions.filter(entry => entry.isDirectory() && /^session_[a-f0-9]{16}$/.test(entry.name)).sort((a, b) => a.name.localeCompare(b.name))) {
+        const sessionPath = join(dayPath, session.name);
+        const files = await readdir(sessionPath, { withFileTypes: true });
+        for (const file of files.filter(entry => entry.isFile() && /^writer_[a-f0-9]{16}\.json$/.test(entry.name)).sort((a, b) => a.name.localeCompare(b.name))) {
+          const record = await readRecordCached(join(sessionPath, file.name));
+          const payload = record?.payload as { day?: unknown; sessionId?: unknown; actorId?: unknown; writerId?: unknown; observations?: ObservationRow[] } | undefined;
+          const observations = payload?.observations;
+          if (!payload || !Array.isArray(observations) || payload.day !== day.name || typeof payload.sessionId !== 'string'
+            || typeof payload.actorId !== 'string' || typeof payload.writerId !== 'string'
+            || session.name !== `session_${sha256(payload.sessionId).slice(0, 16)}` || file.name !== `${payload.writerId}.json`
+            || observations.some(observation => observation.sessionId !== payload.sessionId || observation.actorId !== payload.actorId
+              || observation.journalWriterId !== payload.writerId || observation.recordedDay !== payload.day)) {
+            return fail('CORRUPT_STATE', `Invalid session observation journal ${day.name}/${session.name}/${file.name}.`);
+          }
+          for (const observation of observations) {
+            if (seenIds.has(observation.id)) return fail('CORRUPT_STATE', `Duplicate observation ${observation.id} across session journals.`);
+            seenIds.add(observation.id);
+            rows.push(observation);
+            missingReferences.delete(observation.id);
+          }
+        }
+      }
+      // Recent context is bounded by observations, while older days are visited
+      // only when a checkpoint still pins evidence there.
+      if (rows.length >= MAX_OBSERVATIONS && missingReferences.size === 0) break;
+    }
+    return rows.sort((a, b) => (a.recordedAt ?? '').localeCompare(b.recordedAt ?? '')
+      || (a.sessionId ?? '').localeCompare(b.sessionId ?? '') || (a.sessionSequence ?? 0) - (b.sessionSequence ?? 0));
+  }
+
+  private persistableDocument(document: Document): Document {
+    const legacy = document[persistedObservations] ?? document.observations;
+    const references = new Set(document.checkpoints.flatMap(entry => {
+      const data = entry.data as { evidenceIds?: string[]; judgments?: Array<{ evidenceIds: string[] }> } | undefined;
+      return [...(data?.evidenceIds ?? []), ...(data?.judgments?.flatMap(item => item.evidenceIds) ?? [])];
+    }));
+    // Pin checkpoint evidence into the central transaction that names it. This
+    // closes the race where a writer compacts its journal while a checkpoint is
+    // being committed, without returning routine evidence writes to state.json.
+    const observations = [...legacy];
+    const seen = new Set(observations.map(row => row.id));
+    for (const row of document.observations) {
+      if (references.has(row.id) && !seen.has(row.id)) { observations.push(row); seen.add(row.id); }
+    }
+    return { ...document, observations };
+  }
+
+  private async load(key: string, includeJournals = true): Promise<Document> {
     const staged = this.transaction.getStore()?.pending;
-    const record = staged && this.keyOf(staged) === key ? { payload: staged, revision: staged.revision } : await readRecordCached(this.statePath(key));
+    const hasStaged = Boolean(staged && this.keyOf(staged) === key);
+    const record = hasStaged ? { payload: staged!, revision: staged!.revision } : await readRecordCached(this.statePath(key));
     if (!record) return fail('UNAVAILABLE', 'Project state is missing.');
     const stored = record.payload as Document;
     if (this.selection === undefined) this.selection = stored.selections?.[this.sessionId] ?? stored.selectedWorkId;
+    const legacy = stored[persistedObservations] ?? stored.observations ?? [];
+    const references = new Set(stored.checkpoints.flatMap(entry => {
+      const data = entry.data as { evidenceIds?: string[]; judgments?: Array<{ evidenceIds: string[] }> } | undefined;
+      return [...(data?.evidenceIds ?? []), ...(data?.judgments?.flatMap(item => item.evidenceIds) ?? [])];
+    }));
+    const legacyIds = new Set(legacy.map(row => row.id));
+    const journalReferences = new Set([...references].filter(id => !legacyIds.has(id)));
+    const journal = includeJournals && !hasStaged ? await this.journalObservations(key, journalReferences) : [];
+    const allObservations = includeJournals
+      ? [...(hasStaged ? stored.observations : legacy), ...journal.filter(row => !legacyIds.has(row.id))]
+      : legacy;
+    const recent = new Set(allObservations.slice(-MAX_OBSERVATIONS).map(row => row.id));
+    const observations = includeJournals
+      ? allObservations.filter(row => references.has(row.id) || recent.has(row.id))
+      : legacy;
     return {
       ...stored, selectedWorkId: this.selection, revision: record.revision, day: stored.day ?? key.split('/')[0]!,
-      edges: stored.edges ?? [], observations: stored.observations ?? [],
-      grants: stored.grants ?? { tasks: {}, writer: null },
+      edges: stored.edges ?? [], observations,
+      grants: stored.grants ?? { tasks: {}, writer: null }, [persistedObservations]: legacy,
     };
   }
 
@@ -771,7 +861,7 @@ export class ProcessRuntime {
     const nextDoc: Document = { ...document, selections: { ...document.selections, [this.sessionId]: document.selectedWorkId }, revision: expectedRevision + 1,
       operations: hot };
     if (frame) { frame.baseRevision ??= expectedRevision; frame.pending = nextDoc; }
-    else await publishRecord(path, { expectedRevision, payload: nextDoc, durability, ...(signal ? { signal } : {}) });
+    else await publishRecord(path, { expectedRevision, payload: this.persistableDocument(nextDoc), durability, ...(signal ? { signal } : {}) });
     this.selection = document.selectedWorkId;
     return nextDoc;
   }
@@ -979,7 +1069,7 @@ export class ProcessRuntime {
       if (wantsEvidence) {
         for (const observation of this.contextObservations(state, request.query).slice(0, 3)) {
           items.push({ kind: 'method',
-            summary: `observation ${observation.id}: ${observation.execution?.sourcePaths?.join(', ') ?? ''} ${observation.summary.slice(0, 900)}`,
+            summary: `observation ${observation.id} [${observation.recordedDay ?? state.day}/${observation.sessionId ?? 'legacy'} actor=${observation.actorId ?? 'legacy'}]: ${observation.execution?.sourcePaths?.join(', ') ?? ''} ${observation.summary.slice(0, 900)}`,
             standing: observation.provenance === 'native_observation' ? 'supported' : 'needs_review',
             sources: observation.supports.length ? observation.supports : [contentRef(observation.id, 1, observation)] });
         }
@@ -1173,14 +1263,24 @@ export class ProcessRuntime {
     return fail('INVALID_RESULT', `Work action ${action} is not implemented in this slice.`);
   }
 
-  async recordObservation(summary: string, execution?: HostExecution): Promise<void> {
+  async readObservations(): Promise<readonly ObservationRecord[]> {
     const bound = await this.peekBinding();
-    if (!bound) return;
-    await withFileMutationQueue(this.statePath(this.keyOf(bound)), () => this.recordObservationQueued(bound, summary, execution));
+    return bound ? (await this.load(this.keyOf(bound))).observations : [];
   }
 
-  private async recordObservationQueued(bound: { location?: string; projectId: string; checkoutId: string; day: string }, summary: string, execution?: HostExecution): Promise<void> {
-    const state = await this.load(this.keyOf(bound));
+  async recordObservation(summary: string, execution?: HostExecution): Promise<string | undefined> {
+    const bound = await this.peekBinding();
+    if (!bound) return undefined;
+    const key = this.keyOf(bound);
+    const recordedDay = dayToday();
+    return withFileMutationQueue(this.journalPath(key, recordedDay), () =>
+      this.recordObservationQueued(bound, recordedDay, summary, execution));
+  }
+
+  private async recordObservationQueued(bound: { projectId: string; checkoutId: string; day: string }, recordedDay: string,
+    summary: string, execution?: HostExecution): Promise<string> {
+    const key = this.keyOf(bound);
+    const state = await this.load(key, false);
     const collected = await this.currentSources();
     const index = await this.loadManifest(this.keyOf(bound));
     const candidates = state.tasks.filter(item => item.workId === state.selectedWorkId && item.attemptId === this.attemptId && item.grantStanding === 'valid');
@@ -1205,19 +1305,38 @@ export class ProcessRuntime {
     const expectedMutation = redactedExecution && ['edit', 'write'].includes(redactedExecution.toolName);
     const observed = redactedExecution && (expectedMutation || !redactedExecution.beforeHash || redactedExecution.beforeHash === collected.manifestHash)
       ? redactedExecution : redactedExecution ? { ...redactedExecution, outcome: 'unknown' as const } : undefined;
-    const observation: ObservationRow = { id: newId('obs'), provenance: observed ? 'native_observation' : 'agent_report',
+    const recordedAt = new Date().toISOString();
+    const sessionSequence = ++this.observationSequence;
+    const observationId = `obs_${sha256(`${this.sessionId}\0${this.attemptId}\0${recordedAt}\0${sessionSequence}\0${newId('entropy')}`).slice(0, 24)}`;
+    const observation: ObservationRow = { id: observationId, provenance: observed ? 'native_observation' : 'agent_report',
       summary: redactSecrets(summary).slice(0, 4096), supports, attemptId: this.attemptId, sessionId: this.sessionId,
       checkoutId: bound.checkoutId, ...(state.selectedWorkId ? { workId: state.selectedWorkId } : {}),
       ...(task ? { taskId: task.id } : {}), ...(observed ? { execution: observed } : {}), verification,
-      ...(observed && commandIdentity ? { commandIdentity } : {}), ...(verificationSubstrate ? { verificationSubstrate } : {}) };
+      ...(observed && commandIdentity ? { commandIdentity } : {}), ...(verificationSubstrate ? { verificationSubstrate } : {}),
+      actorId: this.actorId, journalWriterId: this.journalWriterId, recordedDay, recordedAt, sessionSequence };
     // Retention is reference aware. Never discard evidence pinned by a checkpoint.
+    const journalPath = this.journalPath(key, recordedDay);
+    const current = await readRecord(journalPath);
+    const payload = current?.payload as { day?: unknown; sessionId?: unknown; actorId?: unknown; writerId?: unknown; observations?: ObservationRow[] } | undefined;
+    if (current && (!payload || payload.day !== recordedDay || payload.sessionId !== this.sessionId || payload.actorId !== this.actorId
+      || payload.writerId !== this.journalWriterId || !Array.isArray(payload.observations)
+      || payload.observations.some(row => row.sessionId !== this.sessionId || row.actorId !== this.actorId
+        || row.journalWriterId !== this.journalWriterId || row.recordedDay !== recordedDay))) {
+      return fail('CORRUPT_STATE', 'The current session observation journal is inconsistent with its writer.');
+    }
     const references = new Set(state.checkpoints.flatMap(entry => {
       const data = entry.data as { evidenceIds?: string[]; judgments?: Array<{ evidenceIds: string[] }> } | undefined;
       return [...(data?.evidenceIds ?? []), ...(data?.judgments?.flatMap(item => item.evidenceIds) ?? [])];
     }));
-    const all = [...state.observations, observation];
-    const recent = new Set(all.slice(-MAX_OBSERVATIONS).map(item => item.id));
-    await this.save({ ...state, observations: all.filter(item => references.has(item.id) || recent.has(item.id)) }, state.revision, newId('obsop'), undefined, 'light');
+    const all = [...(payload?.observations ?? []), observation];
+    const recent = new Set(all.slice(-MAX_OBSERVATIONS).map(row => row.id));
+    const observations = all.filter(row => references.has(row.id) || recent.has(row.id));
+    await publishRecord(journalPath, {
+      expectedRevision: current?.revision ?? 0,
+      payload: { day: recordedDay, sessionId: this.sessionId, actorId: this.actorId, writerId: this.journalWriterId, observations },
+      durability: 'light', directoryRoot: this.workRootPath(key),
+    });
+    return observation.id;
   }
 
   async understandingPending(): Promise<boolean> {

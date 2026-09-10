@@ -165,7 +165,7 @@ test('topic lookup returns only requested project context within a compact budge
     const { key } = await ids();
     const statePath = join(scopeStore(prjctHome, key, 'work'), 'state.json');
     const state = (await readRecord(statePath))!;
-    const observationId = (state.payload as { observations: Array<{ id: string }> }).observations[0]!.id;
+    const observationId = (await runtime.readObservations())[0]!.id;
     await runtime.execute('prjct_knowledge', {
       action: 'resolve', projectId: (await runtime.identity()).projectId, claimId, resolution: 'confirm',
       rationale: 'Fixture setup.', evidenceIds: [observationId], operationId: 'op_context_resolve',

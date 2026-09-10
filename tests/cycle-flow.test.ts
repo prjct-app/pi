@@ -35,11 +35,7 @@ const setup = async () => {
     const { key } = await ids();
     return (await readRecord(join(scopeStore(prjctHome, key, 'work'), 'state.json')))!.revision;
   };
-  const observations = async () => {
-    const { key } = await ids();
-    const record = await readRecord(join(scopeStore(prjctHome, key, 'work'), 'state.json'));
-    return ((record!.payload as { observations: Array<{ id: string }> }).observations ?? []);
-  };
+  const observations = async () => runtime.readObservations();
   return { root, checkout, runtime, other, workId, ids, rev, observations };
 };
 
@@ -107,6 +103,10 @@ test('completion requires a native observation; a host-recorded bash outcome clo
       judgments: [{ criterionId: 'crit_green', conclusion: 'satisfied', evidenceIds: [obsId!], rationale: 'npm test passed' }],
       operationId: 'op_a2', expectedRevision: await rev(), maxBytes: 4096,
     });
+    const { key } = await ids();
+    const pinnedState = await readRecord(join(scopeStore(runtime.prjctRoot, key, 'work'), 'state.json'));
+    assert.equal((pinnedState!.payload as { observations: Array<{ id: string }> }).observations.some(row => row.id === obsId), true,
+      'the checkpoint transaction must pin its journal evidence before writers can compact it');
     const assessmentId = (assessment.details as { recorded: { reference: { id: string } } }).recorded.reference.id;
 
     const completed = await runtime.execute('prjct_task', {
