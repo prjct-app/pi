@@ -1,9 +1,9 @@
 import { StringEnum } from '@earendil-works/pi-ai';
 import Type from 'typebox';
-import { ContentReferenceSchema, IdentifierSchema, RevisionSchema } from '../workspace/reference-schemas.ts';
+import { ContentReferenceSchema, IdentifierSchema, RevisionSchema, MAX_RESULT_BYTES } from '../workspace/reference-schemas.ts';
 
 const scope = { projectId: IdentifierSchema, workId: Type.Optional(IdentifierSchema),
-  maxBytes: Type.Integer({ minimum: 1, maximum: 50 * 1024 }) };
+  maxBytes: Type.Integer({ minimum: 1, maximum: MAX_RESULT_BYTES }) };
 const resolution = { claimId: IdentifierSchema, operationId: IdentifierSchema, expectedRevision: RevisionSchema,
   rationale: Type.String({ minLength: 1, maxLength: 4096, pattern: '\\S' }),
   evidenceIds: Type.Array(IdentifierSchema, { minItems: 1, maxItems: 32, uniqueItems: true }) };

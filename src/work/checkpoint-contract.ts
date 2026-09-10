@@ -1,7 +1,7 @@
 import { StringEnum } from '@earendil-works/pi-ai';
 import Type from 'typebox';
 
-import { ContentReferenceSchema, IdentifierSchema, RevisionSchema } from '../workspace/reference-schemas.ts';
+import { ContentReferenceSchema, IdentifierSchema, RevisionSchema, MAX_RESULT_BYTES } from '../workspace/reference-schemas.ts';
 const shortText = Type.String({ minLength: 1, maxLength: 1024, pattern: '\\S' });
 const evidenceIds = Type.Array(IdentifierSchema, { maxItems: 64, uniqueItems: true });
 
@@ -42,7 +42,7 @@ export const assertReuseAssessment = ({ data }: ReuseCheckpoint): void => {
 
 const recordScope = { action: StringEnum(['record']), workId: IdentifierSchema, taskId: IdentifierSchema,
   operationId: IdentifierSchema, expectedRevision: RevisionSchema,
-  maxBytes: Type.Integer({ minimum: 1, maximum: 50 * 1024 }) };
+  maxBytes: Type.Integer({ minimum: 1, maximum: MAX_RESULT_BYTES }) };
 
 const workRecordScope = Type.Omit(Type.Object(recordScope), ['taskId']).properties;
 

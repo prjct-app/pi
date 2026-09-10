@@ -1,6 +1,6 @@
 import { StringEnum } from '@earendil-works/pi-ai';
 import Type from 'typebox';
-import { IdentifierSchema } from '../workspace/reference-schemas.ts';
+import { IdentifierSchema, MAX_RESULT_BYTES } from '../workspace/reference-schemas.ts';
 
 // Bounds cap traversal; they are not claims of exhaustive compiler analysis.
 // The owner must disclose unsupported relations, omissions and stale sources.
@@ -14,7 +14,7 @@ export const StructureParameters = Type.Union([
       { minItems: 1, maxItems: 5, uniqueItems: true }),
     maxDepth: Type.Integer({ minimum: 1, maximum: 8 }),
     maxItems: Type.Integer({ minimum: 1, maximum: 128 }),
-    maxBytes: Type.Integer({ minimum: 1, maximum: 50 * 1024 }),
+    maxBytes: Type.Integer({ minimum: 1, maximum: MAX_RESULT_BYTES }),
   }, { additionalProperties: false }),
   Type.Object({
     action: Type.Literal('impact'), checkoutId: IdentifierSchema,
@@ -23,7 +23,7 @@ export const StructureParameters = Type.Union([
       { minItems: 1, maxItems: 5, uniqueItems: true }),
     maxDepth: Type.Integer({ minimum: 1, maximum: 8 }),
     maxItems: Type.Integer({ minimum: 1, maximum: 128 }),
-    maxBytes: Type.Integer({ minimum: 1, maximum: 50 * 1024 }),
+    maxBytes: Type.Integer({ minimum: 1, maximum: MAX_RESULT_BYTES }),
   }, { additionalProperties: false }),
 ], { type: 'object' });
 

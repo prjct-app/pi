@@ -1,6 +1,6 @@
 import Type from 'typebox';
 
-import { IdentifierSchema, RevisionSchema } from '../workspace/reference-schemas.ts';
+import { IdentifierSchema, RevisionSchema, MAX_RESULT_BYTES } from '../workspace/reference-schemas.ts';
 
 export const RefreshInspectSchema = Type.Object({
   action: Type.Literal('inspect'),
@@ -15,7 +15,7 @@ export const RefreshApplySchema = Type.Object({
   expectedConfigRevision: RevisionSchema,
 }, { additionalProperties: false });
 
-const resultBudget = Type.Integer({ minimum: 1, maximum: 50 * 1024 });
+const resultBudget = Type.Integer({ minimum: 1, maximum: MAX_RESULT_BYTES });
 export const RefreshParameters = Type.Union([
   Type.Object({ ...RefreshInspectSchema.properties, maxBytes: resultBudget }, { additionalProperties: false }),
   Type.Object({ ...RefreshApplySchema.properties, maxBytes: resultBudget }, { additionalProperties: false }),

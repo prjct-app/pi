@@ -1,14 +1,14 @@
 import { StringEnum } from '@earendil-works/pi-ai';
 import Type from 'typebox';
 import Schema from '../typebox-schema.ts';
-import { ContentReferenceSchema } from '../workspace/reference-schemas.ts';
+import { ContentReferenceSchema, MAX_RESULT_BYTES } from '../workspace/reference-schemas.ts';
 
 // Pi validates and normalizes this schema before invoking the tool. No second
 // input parser or prepareArguments hook is required.
 export const ContextParameters = Type.Object({
   action: StringEnum(['lookup', 'discover']),
   query: Type.String({ minLength: 1, maxLength: 1024, pattern: '\\S' }),
-  maxBytes: Type.Integer({ minimum: 1, maximum: 50 * 1024 }),
+  maxBytes: Type.Integer({ minimum: 1, maximum: MAX_RESULT_BYTES }),
 }, { additionalProperties: false });
 
 export type ContextRequest = Type.Static<typeof ContextParameters>;

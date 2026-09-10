@@ -1,9 +1,9 @@
 import { StringEnum } from '@earendil-works/pi-ai';
 import Type from 'typebox';
-import { IdentifierSchema, RevisionSchema } from '../workspace/reference-schemas.ts';
+import { IdentifierSchema, RevisionSchema, MAX_RESULT_BYTES } from '../workspace/reference-schemas.ts';
 
 const scope = { workId: IdentifierSchema, taskId: IdentifierSchema,
-  maxBytes: Type.Integer({ minimum: 1, maximum: 50 * 1024 }) };
+  maxBytes: Type.Integer({ minimum: 1, maximum: MAX_RESULT_BYTES }) };
 
 // Observation references are inputs to reconciliation, not proof of consent or
 // cessation. The process must obtain current confirmation through existing Pi UI.

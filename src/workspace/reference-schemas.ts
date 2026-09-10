@@ -1,6 +1,11 @@
 import Type from 'typebox';
 
 // Shared value contracts for internal references, not aliases, URLs or paths.
+
+// Hard ceiling for every prjct-produced result. pi's own output guard truncates
+// payloads around 50KB with a '[Full output: ...]' notice; prjct must never
+// emit anything near that, so all tool budgets cap well below it.
+export const MAX_RESULT_BYTES = 32 * 1024;
 export const IdentifierSchema = Type.String({
   minLength: 1,
   maxLength: 128,
