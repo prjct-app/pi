@@ -55,28 +55,124 @@ export default function prjctExtension(pi: ExtensionAPI) {
   };
   for (const tool of createProcessTools(agentHome, activate, () => attempt, runtime)) pi.registerTool(tool);
 
-  // TUI action results become concise operational receipts for the agent.
-  // Headless modes stay plain stderr; no model turn is triggered there.
-  const tellModel = (ctx: { hasUI: boolean; mode?: string }, text: string): void => {
-    if (!ctx.hasUI || headless(ctx)) return;
-    pi.sendMessage({ customType: 'prjct', display: false,
-      content: `A prjct action produced this result. ${AGENT_OUTPUT_INSTRUCTION} Return one short operational receipt containing the outcome, material facts, and next executable step. Reply with only that receipt; call no tools.\n${text}` },
-      { deliverAs: 'followUp', triggerTurn: true });
+  type ActionContext = Pick<ExtensionContext, 'hasUI' | 'mode' | 'ui'>;
+  type ActionOutcome = Readonly<{ status: 'done' | 'failed'; summary: string; durationMs?: number }>;
+  type PendingAction = {
+    action: string;
+    ids: string[];
+    outcomes: Map<string, ActionOutcome>;
+    ctx: ActionContext;
+    note?: string;
   };
-  // Every command outcome gets a response; the TUI also gets the model summary.
-  const respond = (ctx: { hasUI: boolean; mode?: string; ui: { notify: (text: string, type: 'info' | 'warning' | 'error') => void } },
-    text: string, type: 'info' | 'warning' | 'error'): void => {
-    report(ctx, text, type);
-    tellModel(ctx, text);
+  const ACTION_RESULT_TYPE = 'prjct-action-result';
+  const ACTION_RESULT_CHARS = 900;
+  const pendingActions = new WeakMap<JobRunner, PendingAction[]>();
+  const clip = (text: string, limit: number): string => {
+    const compact = text.replace(/\s+/g, ' ').trim();
+    return compact.length <= limit ? compact : `${compact.slice(0, limit - 1)}…`;
   };
 
-  // One runner per bound project (keyed by its queue file). UI feedback goes
-  // through the context that started it; nothing enters the model's context.
+  // Mirror prjct-cli's compact output contract: one 1–4 line English,
+  // agent-facing receipt per AGENT_OUTPUT_INSTRUCTION. Bounded and hidden.
+  const tellModel = (ctx: ActionContext, action: string, text: string): void => {
+    if (!ctx.hasUI || headless(ctx)) return;
+    const result = clip(text, ACTION_RESULT_CHARS);
+    pi.sendMessage({
+      customType: ACTION_RESULT_TYPE,
+      display: false,
+      content: [
+        `A prjct action produced this result. ${AGENT_OUTPUT_INSTRUCTION}`,
+        'Return one compact prjct receipt of 1–4 lines, about 80 characters per line and at most 320 characters total:',
+        '✓ <action>: <outcome>',
+        '• <one material fact or metric> (optional)',
+        '→ <next executable step> (only when useful)',
+        'Use ⚠ for partial/blocking and ✗ for failure. No heading, preamble, paragraph, tools, internal IDs, paths, logs, child-process details, or raw-output repetition. Reply with only that receipt; call no tools.',
+        `action=${action}`,
+        `result=${result}`,
+      ].join('\n'),
+    }, { deliverAs: 'followUp', triggerTurn: true });
+  };
+
+  // sendMessage participates in model context. Keep a pending receipt for its
+  // immediate turn, then remove consumed receipt prompts on every later call.
+  pi.on('context', event => {
+    const fields = (message: unknown): { customType?: string; content?: unknown; role?: string } =>
+      message && typeof message === 'object' ? message as { customType?: string; content?: unknown; role?: string } : {};
+    const isReceipt = (message: unknown): boolean => {
+      const { customType, content } = fields(message);
+      return customType === ACTION_RESULT_TYPE || (customType === 'prjct' && typeof content === 'string' &&
+        content.startsWith('A prjct action produced this result.'));
+    };
+    const isLegacyBriefNotice = (message: unknown): boolean => {
+      const { customType, content } = fields(message);
+      return customType === 'prjct' && typeof content === 'string' && /^prjct: the \w+ brief is ready;/.test(content);
+    };
+    let lastAssistant = -1, lastReceipt = -1;
+    event.messages.forEach((message, index) => {
+      if (fields(message).role === 'assistant') lastAssistant = index;
+      if (isReceipt(message)) lastReceipt = index;
+    });
+    const pending = lastReceipt > lastAssistant ? lastReceipt : -1;
+    const messages = event.messages.filter((message, index) =>
+      !isLegacyBriefNotice(message) && (!isReceipt(message) || index === pending));
+    return messages.length === event.messages.length ? undefined : { messages };
+  });
+
+  // Every synchronous command outcome gets exactly one receipt in the TUI.
+  const respond = (ctx: ActionContext, action: string, text: string, type: 'info' | 'warning' | 'error'): void => {
+    report(ctx, text, type);
+    tellModel(ctx, action, text);
+  };
+
+  const formatAction = (pending: PendingAction): string => {
+    const details = pending.ids.map(id => {
+      const outcome = pending.outcomes.get(id)!;
+      const duration = outcome.durationMs === undefined ? '' : ` (${(outcome.durationMs / 1000).toFixed(1)}s)`;
+      return `${id}${duration} ${outcome.status}: ${clip(outcome.summary, 320)}`;
+    });
+    return [...(pending.note ? [clip(pending.note, 320)] : []), ...details].join('\n');
+  };
+  const flushActions = (runner: JobRunner): void => {
+    const actions = pendingActions.get(runner) ?? [];
+    const remaining: PendingAction[] = [];
+    for (const pending of actions) {
+      if (pending.ids.some(id => !pending.outcomes.has(id))) { remaining.push(pending); continue; }
+      const text = formatAction(pending);
+      const failed = [...pending.outcomes.values()].some(outcome => outcome.status === 'failed');
+      if (headless(pending.ctx)) report(pending.ctx, `prjct ${pending.action}:\n${text}`, failed ? 'warning' : 'info');
+      else tellModel(pending.ctx, pending.action, text);
+    }
+    if (remaining.length) pendingActions.set(runner, remaining);
+    else pendingActions.delete(runner);
+  };
+  const settleAction = (runner: JobRunner, id: string, outcome: ActionOutcome): void => {
+    for (const pending of pendingActions.get(runner) ?? []) {
+      if (pending.ids.includes(id) && !pending.outcomes.has(id)) pending.outcomes.set(id, outcome);
+    }
+    flushActions(runner);
+  };
+  const reconcileActions = async (runner: JobRunner): Promise<void> => {
+    const file = await runner.read();
+    for (const pending of pendingActions.get(runner) ?? []) {
+      for (const id of pending.ids) {
+        if (pending.outcomes.has(id)) continue;
+        const row = file.jobs[id];
+        if (row?.status === 'done') pending.outcomes.set(id, { status: 'done', summary: row.summary ?? 'completed', ...(row.durationMs === undefined ? {} : { durationMs: row.durationMs }) });
+        else if (row && ['failed', 'interrupted'].includes(row.status)) pending.outcomes.set(id, { status: 'failed', summary: row.error ?? row.status, ...(row.durationMs === undefined ? {} : { durationMs: row.durationMs }) });
+      }
+    }
+    flushActions(runner);
+  };
+  const trackAction = (runner: JobRunner, action: string, ids: readonly string[], ctx: ActionContext, note?: string): void => {
+    const pending: PendingAction = { action, ids: [...ids], outcomes: new Map(), ctx, ...(note ? { note } : {}) };
+    pendingActions.set(runner, [...(pendingActions.get(runner) ?? []), pending]);
+  };
+
+  // One runner per bound project (keyed by its queue file). Model selection
+  // follows the current session while each queued action owns one receipt.
   const runnerFor = async (owner: ProcessRuntime, ctx: Pick<ExtensionContext, 'hasUI' | 'ui' | 'model' | 'mode'>): Promise<JobRunner | undefined> => {
     const path = await owner.jobsPath();
     if (!path) return undefined;
-    // Model services always use the session's current model (provider/id),
-    // including after the user switches model while this runner is cached.
     const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
     const existing = runners.get(path);
     if (existing) {
@@ -87,39 +183,25 @@ export default function prjctExtension(pi: ExtensionAPI) {
     const services = createServices(owner, { extensionPath, selectModel: () => selection.model });
     const status = (text: string | undefined) => { if (ctx.hasUI) ctx.ui.setStatus('prjct', text); };
     let lastProgress = 0;
-    const lastRun = new Map<string, { summary: string; durationMs: number }>();
+    let runner: JobRunner;
     const onEvent = (event: RunnerEvent) => {
       if (event.type === 'started') {
         status(`prjct ${event.id}…`);
-        if (headless(ctx)) report(ctx, `prjct ${event.id}…`, 'info');
       } else if (event.type === 'progress') {
         const nowMs = Date.now();
         if (nowMs - lastProgress > 200) { lastProgress = nowMs; status(`prjct ${event.id} ${event.done}/${event.total}`); }
       } else if (event.type === 'finished') {
-        lastRun.set(event.id, { summary: event.summary, durationMs: event.durationMs });
         pi.appendEntry('prjct_job', { id: event.id, status: 'done', summary: event.summary, durationMs: event.durationMs });
-        if (headless(ctx)) report(ctx, `prjct ${event.id} done (${(event.durationMs / 1000).toFixed(1)}s): ${event.summary}`, 'info');
-        // A model brief is new knowledge the agent may want: one line, next turn, no interruption.
-        if ((MODEL_SERVICES as readonly string[]).includes(event.id)) {
-          void pi.sendMessage({ customType: 'prjct', content: `prjct: the ${event.id} brief is ready; prjct_context lookup "${event.id}" serves it.`, display: true }, { deliverAs: 'nextTurn' });
-        }
+        settleAction(runner, event.id, { status: 'done', summary: event.summary, durationMs: event.durationMs });
       } else if (event.type === 'failed') {
         pi.appendEntry('prjct_job', { id: event.id, status: 'failed', error: event.error });
-        respond(ctx, `prjct ${event.id} failed: ${event.error}`, 'warning');
+        settleAction(runner, event.id, { status: 'failed', summary: event.error });
       } else if (event.type === 'idle') {
         status(undefined);
-        if (event.ran > 0 && (ctx.hasUI || headless(ctx))) report(ctx, `prjct: ${event.ran} service(s) finished: ${event.ids.join(', ')}. /prjct status`, 'info');
-        if (event.ran > 0) {
-          const details = event.ids.map(id => {
-            const row = lastRun.get(id);
-            return row ? `${id} (${(row.durationMs / 1000).toFixed(1)}s): ${row.summary}` : id;
-          }).join('\n');
-          lastRun.clear();
-          tellModel(ctx, `prjct services finished:\n${details}`);
-        }
+        void reconcileActions(runner);
       }
     };
-    const runner = new JobRunner({ path, services, onEvent });
+    runner = new JobRunner({ path, services, onEvent });
     runners.set(path, { runner, selection });
     return runner;
   };
@@ -154,15 +236,16 @@ export default function prjctExtension(pi: ExtensionAPI) {
     if (head === 'init' || head === 'sync') {
       const connected = head === 'init' ? await owner.connectProject(ctx.signal) : undefined;
       const runner = await runnerFor(owner, ctx);
-      if (!runner) { respond(ctx, 'No bound project. Run /prjct init first.', 'error'); return; }
+      if (!runner) { respond(ctx, head, 'No bound project. Run /prjct init first.', 'error'); return; }
       const queued = await owner.shareWalk(() => head === 'init' ? runner.enqueue([...MECHANICAL_SERVICES], 'init') : runner.enqueueStale('sync'));
       // A re-run never re-creates: it refreshes only the services whose inputs changed.
       const refreshing = head === 'sync' || connected?.alreadyBound;
       const tail = queued.length ? `${refreshing ? 'Refreshing out-of-date services' : 'Queued'}: ${queued.join(', ')}. /prjct status follows progress.` : 'All services are current.';
       const initialization = connected ? `${connected.alreadyBound ? 'Project already initialized.' : 'Project initialized.'} ${connected.text} ` : '';
-      // Queued work is summarized by the runner's idle event; a no-op answers now.
-      if (queued.length) report(ctx, `${initialization}${tail}`, 'info');
-      else respond(ctx, `${initialization}${tail}`, 'info');
+      if (queued.length) {
+        trackAction(runner, head, queued, ctx, initialization.trim());
+        report(ctx, `${initialization}${tail}`, 'info');
+      } else respond(ctx, head, `${initialization}${tail}`, 'info');
       runner.start();
       // Headless hosts (print/JSON) have no later turn to observe progress: finish here.
       if (!ctx.hasUI) await runner.idle();
@@ -170,63 +253,65 @@ export default function prjctExtension(pi: ExtensionAPI) {
     }
     if (head === 'status') {
       const runner = await runnerFor(owner, ctx);
-      if (!runner) { respond(ctx, 'No bound project. Run /prjct init first.', 'error'); return; }
+      if (!runner) { respond(ctx, 'status', 'No bound project. Run /prjct init first.', 'error'); return; }
       const lines = [await owner.statusText(), 'Services:', ...formatJobs(await runner.read(), SERVICE_ORDER), await owner.understandingText()];
-      respond(ctx, lines.join('\n'), 'info');
+      respond(ctx, 'status', lines.join('\n'), 'info');
       return;
     }
     if (head === 'run') {
       const id = rest[0] ?? '';
-      if (!(SERVICE_ORDER as readonly string[]).includes(id)) { respond(ctx, `Unknown service "${id}". Services: ${SERVICE_ORDER.join(', ')}.`, 'error'); return; }
+      if (!(SERVICE_ORDER as readonly string[]).includes(id)) { respond(ctx, 'run', `Unknown service "${id}". Services: ${SERVICE_ORDER.join(', ')}.`, 'error'); return; }
       const runner = await runnerFor(owner, ctx);
-      if (!runner) { respond(ctx, 'No bound project. Run /prjct init first.', 'error'); return; }
+      if (!runner) { respond(ctx, 'run', 'No bound project. Run /prjct init first.', 'error'); return; }
       const queued = await owner.shareWalk(() => runner.enqueue([id], 'run', { force: true }));
-      if (queued.length) report(ctx, `Queued: ${queued.join(', ')}.`, 'info');
-      else respond(ctx, `${id} is already queued or running.`, 'info');
+      if (queued.length) { trackAction(runner, 'run', queued, ctx); report(ctx, `Queued: ${queued.join(', ')}.`, 'info'); }
+      else respond(ctx, 'run', `${id} is already queued or running.`, 'info');
       runner.start();
       if (!ctx.hasUI) await runner.idle();
       return;
     }
     if (head === 'analyze') {
       const runner = await runnerFor(owner, ctx);
-      if (!runner) { respond(ctx, 'No bound project. Run /prjct init first.', 'error'); return; }
+      if (!runner) { respond(ctx, 'analyze', 'No bound project. Run /prjct init first.', 'error'); return; }
       const queued = await owner.shareWalk(() => runner.enqueue([...MODEL_SERVICES], 'analyze', { force: true }));
-      if (queued.length) report(ctx, `Queued: ${queued.join(', ')} (child Pi, ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : 'default model'}, thinking low). /prjct status follows progress.`, 'info');
-      else respond(ctx, 'Analysis services are already queued or running.', 'info');
+      if (queued.length) {
+        trackAction(runner, 'analyze', queued, ctx);
+        report(ctx, `Queued: ${queued.join(', ')} (child Pi, ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : 'default model'}, thinking low). /prjct status follows progress.`, 'info');
+      } else respond(ctx, 'analyze', 'Analysis services are already queued or running.', 'info');
       runner.start();
       if (!ctx.hasUI) await runner.idle();
       return;
     }
     if (head === 'export') {
       const target = rest[0];
-      if (!target) { respond(ctx, 'Usage: /prjct export <path> [--force]. Writes the purpose, stack, patterns and history briefs as one markdown file (for AGENTS.md-style consumers).', 'error'); return; }
+      if (!target) { respond(ctx, 'export', 'Usage: /prjct export <path> [--force]. Writes the purpose, stack, patterns and history briefs as one markdown file (for AGENTS.md-style consumers).', 'error'); return; }
       const exported = await owner.exportBriefs();
-      if (!exported) { respond(ctx, 'No bound project. Run /prjct init first.', 'error'); return; }
-      if (!exported.included.length) { respond(ctx, 'Nothing to export yet: run /prjct init (stack, history) and /prjct analyze (purpose, patterns) first.', 'error'); return; }
+      if (!exported) { respond(ctx, 'export', 'No bound project. Run /prjct init first.', 'error'); return; }
+      if (!exported.included.length) { respond(ctx, 'export', 'Nothing to export yet: run /prjct init (stack, history) and /prjct analyze (purpose, patterns) first.', 'error'); return; }
       let destination: string;
       try { destination = await canonicalMutationPath(ctx.cwd, target); }
-      catch (error) { respond(ctx, `Export refused: ${(error as Error).message}`, 'error'); return; }
+      catch (error) { respond(ctx, 'export', `Export refused: ${(error as Error).message}`, 'error'); return; }
       const { writeFile, stat } = await import('node:fs/promises');
       const exists = await stat(destination).then(() => true, () => false);
-      if (exists && !rest.includes('--force')) { respond(ctx, `${destination} exists; add --force to overwrite.`, 'error'); return; }
+      if (exists && !rest.includes('--force')) { respond(ctx, 'export', `${destination} exists; add --force to overwrite.`, 'error'); return; }
       if (!ctx.hasUI || headless(ctx) || !await ctx.ui.confirm('Authorize prjct export', `Write ${Buffer.byteLength(exported.text, 'utf8')} bytes to ${destination}?`)) {
-        respond(ctx, 'Export refused: current host confirmation is required and headless execution fails closed.', 'error'); return;
+        respond(ctx, 'export', 'Export refused: current host confirmation is required and headless execution fails closed.', 'error'); return;
       }
       await withFileMutationQueue(destination, () => writeFile(destination, exported.text, 'utf8'));
-      respond(ctx, `Exported ${exported.included.join(', ')} to ${destination} (${Buffer.byteLength(exported.text, 'utf8')} bytes).`, 'info');
+      respond(ctx, 'export', `Exported ${exported.included.join(', ')} to ${destination} (${Buffer.byteLength(exported.text, 'utf8')} bytes).`, 'info');
       return;
     }
     if (head === 'work') {
       const title = sub.slice('work'.length).trim();
-      respond(ctx, title ? await owner.createWork(title) : await owner.listWorksText(), 'info');
+      respond(ctx, 'work', title ? await owner.createWork(title) : await owner.listWorksText(), 'info');
       return;
     }
     if (head === 'ship') {
-      respond(ctx, await owner.ship(), 'info');
+      respond(ctx, 'ship', await owner.ship(), 'info');
       return;
     }
-    if (!sub) respond(ctx, await owner.statusText(), 'info');
-    else respond(ctx, usage, 'error');
+    if (!sub) respond(ctx, 'status', await owner.statusText(), 'info');
+    else respond(ctx, 'help', usage, 'error');
   };
   pi.registerCommand('prjct', {
     description: 'init (connect + background index/stack/history) | sync | status | run <service> | analyze (purpose + patterns in a child Pi) | export <path> | work [title] | ship.',
