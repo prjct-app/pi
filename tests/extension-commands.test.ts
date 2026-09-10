@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import prjctExtension from '../src/extension.ts';
+import { SERVICE_ORDER } from '../src/jobs/services.ts';
 import { ProcessRuntime } from '../src/pi/process-runtime.ts';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from './test-paths.ts';
@@ -11,7 +12,11 @@ import { tmpdir } from './test-paths.ts';
 // A stub host: enough of ExtensionAPI and the command context for /prjct to run
 // headless. The real Pi session path is covered by extension-session.test.ts.
 const stubHost = () => {
-  const commands = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
+  type CommandOptions = {
+    handler: (args: string, ctx: unknown) => Promise<void>;
+    getArgumentCompletions?: (prefix: string) => Array<{ value: string; label: string }> | null;
+  };
+  const commands = new Map<string, CommandOptions>();
   const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
   const sent: Array<{ text: string; options: unknown }> = [];
   const messages: Array<{ message: { content: string }; options: unknown }> = [];
@@ -19,7 +24,7 @@ const stubHost = () => {
   let active: string[] = [];
   const pi = {
     registerTool: () => undefined,
-    registerCommand: (name: string, options: { handler: (args: string, ctx: unknown) => Promise<void> }) => commands.set(name, options.handler),
+    registerCommand: (name: string, options: CommandOptions) => commands.set(name, options),
     on: (event: string, handler: (event: unknown, ctx: unknown) => unknown) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
     sendUserMessage: (text: string, options: unknown) => sent.push({ text, options }),
     sendMessage: async (message: { content: string }, options: unknown) => { messages.push({ message, options }); },
@@ -52,7 +57,7 @@ test('headless commands keep the user informed: every command and job lifecycle 
   prjctExtension(host.pi);
   const notices: string[] = [];
   const ctx = { ...stubCtx(cwd, notices), mode: 'print' as const };
-  const run = (args: string) => host.commands.get('prjct')!(args, ctx);
+  const run = (args: string) => host.commands.get('prjct')!.handler(args, ctx);
 
   const errLines: string[] = [];
   const originalConsoleError = console.error;
@@ -119,7 +124,7 @@ test('/prjct init connects and runs services without prompting the model; status
   assert.deepEqual([...host.commands.keys()], ['prjct'], 'only /prjct is registered; the /p alias is gone');
   const notices: string[] = [];
   const ctx = stubCtx(cwd, notices);
-  const run = (args: string) => host.commands.get('prjct')!(args, ctx);
+  const run = (args: string) => host.commands.get('prjct')!.handler(args, ctx);
 
   await run('status');
   assert.match(notices.at(-1) ?? '', /No bound project/);
@@ -200,4 +205,19 @@ test('/prjct init connects and runs services without prompting the model; status
   await run('bogus');
   assert.match(notices.at(-1) ?? '', /^Usage:/);
   for (const handler of host.handlers.get('session_shutdown') ?? []) await handler({}, ctx);
+});
+
+test('/prjct offers argument completions for subcommands and run services', async t => {
+  const host = stubHost();
+  prjctExtension(host.pi);
+  const complete = host.commands.get('prjct')!.getArgumentCompletions!;
+  const values = (prefix: string) => (complete(prefix) ?? []).map(item => item.value);
+  t.after(async () => { for (const handler of host.handlers.get('session_shutdown') ?? []) await handler({}, undefined); });
+
+  assert.deepEqual(values(''), ['init', 'sync', 'status', 'run', 'analyze', 'export', 'work', 'ship']);
+  assert.deepEqual(values('st'), ['status']);
+  assert.deepEqual(values('run '), SERVICE_ORDER.map(id => `run ${id}`));
+  assert.deepEqual(values('run p'), ['run purpose', 'run patterns']);
+  assert.deepEqual(values('work '), []);
+  assert.equal(complete('work '), null, 'no suggestions where the command takes free text');
 });

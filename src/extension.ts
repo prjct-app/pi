@@ -25,6 +25,10 @@ const report = (ctx: { mode?: string; ui: { notify: (text: string, type: 'info' 
   else ctx.ui.notify(text, type);
 };
 
+// Subcommands offered to the TUI when completing `/prjct <args>`. Keep in sync
+// with commandHandler below.
+const SUBCOMMANDS = ['init', 'sync', 'status', 'run', 'analyze', 'export', 'work', 'ship'] as const;
+
 // Registers process tools and /prjct. Does not inject context or create a store at
 // load. Durable process state lives in the global prjct home, never the client checkout.
 export default function prjctExtension(pi: ExtensionAPI) {
@@ -161,6 +165,17 @@ export default function prjctExtension(pi: ExtensionAPI) {
   };
   pi.registerCommand('prjct', {
     description: 'init (connect + background index/stack/history) | sync | status | run <service> | analyze (purpose + patterns in a child Pi) | export <path> | work [title] | ship.',
+    getArgumentCompletions(prefix) {
+      const parts = prefix.split(/\s+/);
+      let values: readonly string[] = [];
+      if (parts.length === 1) values = SUBCOMMANDS;
+      else if (parts.length === 2 && parts[0] === 'run') values = SERVICE_ORDER;
+      const stem = parts.slice(0, -1).join(' ');
+      const items = values
+        .filter(value => value.startsWith(parts.at(-1) ?? ''))
+        .map(value => ({ value: `${stem ? `${stem} ` : ''}${value}`, label: value }));
+      return items.length ? items : null;
+    },
     handler: commandHandler,
   });
 
