@@ -31,6 +31,7 @@ import { listMethodDocuments, loadMethodDocument, matchMethods, methodCatalog } 
 import { reconstructBinding } from '../work/session-binding.ts';
 import { assessCompletion, type CompletionSnapshot } from '../work/completion.ts';
 import { assertTaskTransition, type TransitionState } from '../work/transition-preconditions.ts';
+import { hasVerificationPair } from '../work/verification-pair.ts';
 import { validateContextResponse } from './context-contract.ts';
 import { validateDiscoveryResponse } from './discovery-result.ts';
 import { validateStateResult } from './state-result-contracts.ts';
@@ -55,7 +56,7 @@ type GrantRow = { attemptId: string; generation: number; standing: 'valid' | 'un
 type EdgeRow = { from: string; to: string; relation: string };
 export type HostExecution = { toolCallId: string; toolName: string; command?: string; outcome: 'succeeded' | 'failed' | 'unknown'; beforeHash?: string; sourcePaths?: string[] };
 type ObservationRow = { id: string; provenance: 'native_observation' | 'agent_report'; summary: string; supports: Ref[];
-  attemptId?: string; workId?: string; taskId?: string; execution?: HostExecution; verification?: boolean };
+  attemptId?: string; workId?: string; taskId?: string; execution?: HostExecution; verification?: boolean; commandIdentity?: string };
 type Document = { projectId: string; checkoutId: string; location: string; day: string; revision: number;
   works: WorkRow[]; tasks: TaskRow[]; claims: ClaimRow[]; artifacts: ArtifactRow[];
   checkpoints: CheckpointRow[]; plans: PlanRow[]; selectedWorkId: string | null; selections?: Record<string, string | null>;
@@ -1018,6 +1019,12 @@ export class ProcessRuntime {
     const candidates = state.tasks.filter(item => item.workId === state.selectedWorkId && item.attemptId === this.attemptId && item.grantStanding === 'valid');
     const task = candidates.length === 1 ? candidates[0] : undefined;
     const command = execution?.command?.trim();
+    // The identity is derived before redaction so distinct secrets or arguments
+    // cannot collapse to the same retained display text. It establishes exact
+    // command equality only; environment and causal equivalence remain unknown.
+    const commandIdentity = execution?.toolName === 'bash' && command
+      ? sha256(`prjct:verification-command:v1\0${command}`)
+      : undefined;
     const verification = Boolean(command && index?.profile.tests.command && command === index.profile.tests.command.trim());
     const supports = execution?.sourcePaths?.length
       ? execution.sourcePaths.filter(path => collected.hashes[path] !== undefined).map(path => ({ id: sourceId(path), revision: index?.appliedRevision ?? 1, contentHash: collected.hashes[path]! }))
@@ -1027,7 +1034,8 @@ export class ProcessRuntime {
       ? redactedExecution : redactedExecution ? { ...redactedExecution, outcome: 'unknown' as const } : undefined;
     const observation: ObservationRow = { id: newId('obs'), provenance: observed ? 'native_observation' : 'agent_report',
       summary: redactSecrets(summary).slice(0, 4096), supports, attemptId: this.attemptId, ...(state.selectedWorkId ? { workId: state.selectedWorkId } : {}),
-      ...(task ? { taskId: task.id } : {}), ...(observed ? { execution: observed } : {}), verification };
+      ...(task ? { taskId: task.id } : {}), ...(observed ? { execution: observed } : {}), verification,
+      ...(observed && commandIdentity ? { commandIdentity } : {}) };
     // Retention is reference aware. Never discard evidence pinned by a checkpoint.
     const references = new Set(state.checkpoints.flatMap(entry => {
       const data = entry.data as { evidenceIds?: string[]; judgments?: Array<{ evidenceIds: string[] }> } | undefined;
@@ -1525,6 +1533,15 @@ export class ProcessRuntime {
           const rows = await this.requireEvidence(state, evidenceIds, { workId: String(params.workId), taskId: String(params.taskId) });
           const outcome = stage === 'red_observed' ? 'failed' : 'succeeded';
           if (!rows.some(row => row.verification && row.execution?.outcome === outcome)) fail('UNVERIFIABLE_EVIDENCE', `No project verification with the required ${outcome} outcome.`);
+          if (stage === 'green_observed') {
+            const red = [...state.checkpoints].reverse().find(row => row.workId === params.workId && row.taskId === params.taskId && row.kind === 'progress'
+              && (row.data as { methodId?: string; stage?: string } | undefined)?.methodId === 'tdd'
+              && (row.data as { stage?: string } | undefined)?.stage === 'red_observed');
+            const failedIds = (red?.data as { evidenceIds?: string[] } | undefined)?.evidenceIds ?? [];
+            if (!hasVerificationPair(state.observations, failedIds, evidenceIds)) {
+              fail('UNVERIFIABLE_EVIDENCE', 'Green requires a succeeding native observation from the same command after the recorded failure; identity-less legacy evidence must be re-recorded.');
+            }
+          }
         }
       }
       // Human decisions require a real user observation captured from Pi input,
@@ -1537,19 +1554,17 @@ export class ProcessRuntime {
         && !state.artifacts.some(row => row.kind === 'handoff' && !row.stagedBlobId && (!params.workId || row.workId === params.workId))) {
         fail('UNVERIFIABLE_EVIDENCE', 'Handoff readiness requires a published handoff artifact for this work.');
       }
-      // A diagnosis fix needs an executed loop: a prior reproduced failure and a
-      // succeeding verification command. A source read is not a loop.
+      // A diagnosis fix needs an executed loop: the exact reproduced failure
+      // and a later success from the same original command identity. Historical
+      // red evidence is not revalidated against post-fix sources; the green row
+      // was already required above and is current under the normal evidence gate.
       if (methodId === 'diagnosing-bugs' && stage === 'fixed') {
-        const reproduced = state.checkpoints.some(row => row.workId === params.workId && row.taskId === params.taskId && row.kind === 'progress'
+        const reproduced = [...state.checkpoints].reverse().find(row => row.workId === params.workId && row.taskId === params.taskId && row.kind === 'progress'
           && (row.data as { methodId?: string; stage?: string } | undefined)?.methodId === 'diagnosing-bugs'
-          && (row.data as { stage?: string } | undefined)?.stage === 'reproduced'
-          && ((row.data as { evidenceIds?: string[] } | undefined)?.evidenceIds ?? []).some(id => {
-            const obs = state.observations.find(item => item.id === id);
-            return obs?.execution?.toolName === 'bash' && obs.execution.outcome === 'failed';
-          }));
-        if (!reproduced) fail('UNVERIFIABLE_EVIDENCE', 'Fix requires a prior reproduced stage backed by a failed native command observation.');
-        if (!evidenceRows.some(row => row.execution?.toolName === 'bash' && row.execution.outcome === 'succeeded')) {
-          fail('UNVERIFIABLE_EVIDENCE', 'Fix requires a succeeding native command observation; a read is not a feedback loop.');
+          && (row.data as { stage?: string } | undefined)?.stage === 'reproduced');
+        const failedIds = (reproduced?.data as { evidenceIds?: string[] } | undefined)?.evidenceIds ?? [];
+        if (!hasVerificationPair(state.observations, failedIds, evidenceIds)) {
+          fail('UNVERIFIABLE_EVIDENCE', 'Fix requires a succeeding native observation from the same command after the recorded failure; identity-less legacy evidence must be re-recorded.');
         }
       }
     }
