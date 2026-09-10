@@ -11,7 +11,13 @@ export const MODEL_SERVICES = ['purpose', 'patterns'] as const;
 export const SERVICE_ORDER = [...MECHANICAL_SERVICES, ...MODEL_SERVICES] as const;
 export type ServiceId = typeof SERVICE_ORDER[number];
 
-export type ModelServiceOptions = Readonly<{ extensionPath: string; model?: string; thinking?: string }>;
+export type ModelServiceOptions = Readonly<{
+  extensionPath: string;
+  model?: string;
+  /** Resolve at job start so a cached runner follows later session-model changes. */
+  selectModel?: () => string | undefined;
+  thinking?: string;
+}>;
 
 const MODEL_TOOLS = ['read', 'prjct_context', 'prjct_search', 'prjct_knowledge'];
 
@@ -76,10 +82,13 @@ export const createServices = (runtime: ProcessRuntime, model?: ModelServiceOpti
       // drifting mark them needs_review in lookup instead of spending a model pass.
       stale: async () => !(await runtime.readContextDoc(id)),
       run: async ctx => {
+        // Snapshot once: a session switch affects the next job, never the
+        // provenance of a child that is already running.
+        const selectedModel = model.selectModel ? model.selectModel() : model.model;
         const facts = await runtime.analysisFacts();
         const result = await runModelJob({
           cwd: runtime.cwd, extensionPath: model.extensionPath, prompt: spec.prompt(facts), tools: MODEL_TOOLS,
-          ...(model.model ? { model: model.model } : {}), ...(model.thinking ? { thinking: model.thinking } : {}),
+          ...(selectedModel ? { model: selectedModel } : {}), ...(model.thinking ? { thinking: model.thinking } : {}),
           env: { PRJCT_JOB: id, ...(runtime.prjctRoot ? { PRJCT_HOME: runtime.prjctRoot } : {}) },
           signal: ctx.signal, onTurn: (turns, toolCalls) => ctx.onProgress(toolCalls, Math.max(toolCalls, 12)),
           ...(await runtime.jobLogPath(id) ? { logPath: (await runtime.jobLogPath(id))! } : {}),
@@ -90,7 +99,7 @@ export const createServices = (runtime: ProcessRuntime, model?: ModelServiceOpti
           throw new Error(`child pi exited ${result.exitCode} without a brief${result.errorMessage ? `: ${result.errorMessage}` : ''}${result.stderr.trim() ? ` (${result.stderr.trim().split('\n').at(-1)})` : ''}${log ? `; log ${log}` : ''}`);
         }
         const manifestHash = (await runtime.indexManifestHash()) ?? 'none';
-        const freshness = { manifestHash, ...(model.model ? { model: model.model } : {}) };
+        const freshness = { manifestHash, ...(selectedModel ? { model: selectedModel } : {}) };
         const written = await runtime.writeContextDoc(id, brief, freshness, ctx.signal);
         const cost = result.usage.cost ? `, $${result.usage.cost.toFixed(4)}` : '';
         return { summary: `${result.turns} turns, ${result.toolCalls} tool calls, ${written.bytes} bytes${cost}`, freshness };

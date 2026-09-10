@@ -158,9 +158,11 @@ test('/prjct init connects and runs services without prompting the model; status
   await run('run nope');
   assert.match(notices.at(-1) ?? '', /Unknown service "nope"/);
 
-  // analyze is the only path that asks a model: purpose and patterns in a child Pi with the session model.
+  // The runner was created by init with brief-model. A later model switch must
+  // apply to newly queued analysis jobs instead of reusing that cached choice.
+  ctx.model = { provider: 'faux', id: 'replacement-model' };
   await run('analyze');
-  assert.match(notices.at(-1) ?? '', /Queued: purpose, patterns \(child Pi, faux\/brief-model, thinking low\)/);
+  assert.match(notices.at(-1) ?? '', /Queued: purpose, patterns \(child Pi, faux\/replacement-model, thinking low\)/);
   assert.equal(host.sent.length, 0, 'the session model is never prompted');
   assert.equal(host.messages.length, 2, 'one next-turn line per finished brief');
   assert.match(String(host.messages[0]?.message.content ?? ''), /purpose brief is ready/);
@@ -169,10 +171,10 @@ test('/prjct init connects and runs services without prompting the model; status
   const purpose = await runtime.readContextDoc('purpose');
   assert.match(purpose?.text ?? '', /^# Purpose\n/);
   assert.match(purpose?.text ?? '', /tools: read,prjct_context,prjct_search,prjct_knowledge/);
-  assert.match(purpose?.text ?? '', /model: faux\/brief-model/);
+  assert.match(purpose?.text ?? '', /model: faux\/replacement-model/);
   assert.match(purpose?.text ?? '', /extension: loaded; no-extensions: true/);
   assert.equal(purpose?.text.includes('preamble'), false, 'only the brief is kept');
-  assert.equal(purpose?.freshness.model, 'faux/brief-model');
+  assert.equal(purpose?.freshness.model, 'faux/replacement-model');
   assert.match((await runtime.readContextDoc('patterns'))?.text ?? '', /^# Patterns\n/);
   await run('status');
   assert.match(notices.at(-1) ?? '', /purpose\s+done\s+[\d.]+s\s+2 turns, 1 tool calls/);
