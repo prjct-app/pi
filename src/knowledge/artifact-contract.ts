@@ -1,9 +1,9 @@
 import { StringEnum } from '@earendil-works/pi-ai';
 import Type from 'typebox';
-import { ContentReferenceSchema, IdentifierSchema, PageCursorSchema } from '../workspace/reference-schemas.ts';
+import { ContentReferenceSchema, IdentifierSchema, PageCursorSchema, MAX_RESULT_BYTES } from '../workspace/reference-schemas.ts';
 
 const scope = { projectId: IdentifierSchema, workId: Type.Optional(IdentifierSchema),
-  maxBytes: Type.Integer({ minimum: 1, maximum: 50 * 1024 }) };
+  maxBytes: Type.Integer({ minimum: 1, maximum: MAX_RESULT_BYTES }) };
 const kind = StringEnum(['research', 'spec', 'plan', 'prototype', 'questionnaire', 'analysis', 'handoff', 'evidence', 'note']);
 const publication = { action: StringEnum(['publish']), operationId: IdentifierSchema, kind,
   previous: Type.Optional(ContentReferenceSchema), ...scope };

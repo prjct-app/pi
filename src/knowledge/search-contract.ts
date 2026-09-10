@@ -1,6 +1,6 @@
 import { StringEnum } from '@earendil-works/pi-ai';
 import Type from 'typebox';
-import { IdentifierSchema, PageCursorSchema } from '../workspace/reference-schemas.ts';
+import { IdentifierSchema, PageCursorSchema, MAX_RESULT_BYTES } from '../workspace/reference-schemas.ts';
 
 // Pi owns validation/normalization. Searching never authorizes refresh or analysis.
 export const SearchParameters = Type.Object({
@@ -9,7 +9,7 @@ export const SearchParameters = Type.Object({
   query: Type.String({ minLength: 1, maxLength: 1024, pattern: '\\S' }),
   kinds: Type.Optional(Type.Array(StringEnum(['source', 'claim', 'artifact']), { minItems: 1, maxItems: 3, uniqueItems: true })),
   maxItems: Type.Integer({ minimum: 1, maximum: 32 }),
-  maxBytes: Type.Integer({ minimum: 1, maximum: 50 * 1024 }),
+  maxBytes: Type.Integer({ minimum: 1, maximum: MAX_RESULT_BYTES }),
 }, { additionalProperties: false });
 
 export type SearchRequest = Type.Static<typeof SearchParameters>;

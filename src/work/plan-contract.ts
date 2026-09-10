@@ -1,8 +1,8 @@
 import { StringEnum } from '@earendil-works/pi-ai';
 import Type from 'typebox';
-import { ContentReferenceSchema, IdentifierSchema, RevisionSchema } from '../workspace/reference-schemas.ts';
+import { ContentReferenceSchema, IdentifierSchema, RevisionSchema, MAX_RESULT_BYTES } from '../workspace/reference-schemas.ts';
 
-const scope = { workId: IdentifierSchema, maxBytes: Type.Integer({ minimum: 1, maximum: 50 * 1024 }) };
+const scope = { workId: IdentifierSchema, maxBytes: Type.Integer({ minimum: 1, maximum: MAX_RESULT_BYTES }) };
 const mutation = { operationId: IdentifierSchema, expectedRevision: RevisionSchema };
 
 // Content is authored/read with native Pi tools. Adoption names immutable content

@@ -1,8 +1,8 @@
 import { StringEnum } from '@earendil-works/pi-ai';
 import Type from 'typebox';
-import { ContentReferenceSchema, IdentifierSchema, PageCursorSchema, RevisionSchema } from '../workspace/reference-schemas.ts';
+import { ContentReferenceSchema, IdentifierSchema, PageCursorSchema, RevisionSchema, MAX_RESULT_BYTES } from '../workspace/reference-schemas.ts';
 
-const resultBudget = Type.Integer({ minimum: 1, maximum: 50 * 1024 });
+const resultBudget = Type.Integer({ minimum: 1, maximum: MAX_RESULT_BYTES });
 const mutation = { operationId: IdentifierSchema, expectedRevision: RevisionSchema };
 
 // Operation alternatives are one native JSON Schema, not a process-owned parser.
