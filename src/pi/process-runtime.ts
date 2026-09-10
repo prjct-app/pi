@@ -524,7 +524,7 @@ export class ProcessRuntime {
   }
 
   /**
-   * Portable, agent-agnostic markdown assembled from the briefs (purpose, stack,
+   * Portable, agent-facing English markdown assembled from the briefs (purpose, stack,
    * patterns, history). Returned as text; writing it anywhere is the caller's
    * explicit, opt-in decision.
    */

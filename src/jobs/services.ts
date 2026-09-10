@@ -1,3 +1,4 @@
+import { AGENT_OUTPUT_INSTRUCTION } from '../agent-output.ts';
 import type { ProcessRuntime } from '../pi/process-runtime.ts';
 import { extractBrief, runModelJob } from './model-job.ts';
 import type { Service } from './runner.ts';
@@ -25,6 +26,7 @@ export type AnalysisFacts = Readonly<{ projectId: string; checkoutId: string; do
 type BriefSpec = Readonly<{ heading: string; maxBytes: number; prompt: (facts: AnalysisFacts) => string }>;
 
 const factsLine = (facts: AnalysisFacts): string =>
+  `${AGENT_OUTPUT_INSTRUCTION} ` +
   `Facts: projectId ${facts.projectId}; checkoutId ${facts.checkoutId} (use it verbatim in prjct_search). ` +
   `Documentation files present: ${facts.docFiles.length ? facts.docFiles.join(', ') : 'none'}. ` +
   `Entry points present: ${facts.entryPoints.length ? facts.entryPoints.join(', ') : 'none detected'}. ` +

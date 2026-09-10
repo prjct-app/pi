@@ -224,7 +224,7 @@ test('/prjct offers argument completions for subcommands and run services', asyn
   assert.equal(complete('work '), null, 'no suggestions where the command takes free text');
 });
 
-test('TUI action results are handed to the model for a human summary; headless never triggers a turn', async t => {
+test('TUI action results request concise English agent-facing output; headless never triggers a turn', async t => {
   const root = await mkdtemp(join(tmpdir(), 'prjct-summaries-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const cwd = join(root, 'client'), agentHome = join(root, 'agent');
@@ -253,6 +253,9 @@ test('TUI action results are handed to the model for a human summary; headless n
   assert.equal(host.messages.length, 1);
   const first = host.messages[0]!;
   assert.deepEqual(first.options, { deliverAs: 'followUp', triggerTurn: true });
+  assert.match(String(first.message.content), /Write prjct output in English for coding agents/);
+  assert.match(String(first.message.content), /operational receipt/);
+  assert.doesNotMatch(String(first.message.content), /Explain it to the user|same language/i);
   assert.match(String(first.message.content), /No bound project/);
   assert.equal(first.message.display, false, 'raw machine text stays out of the transcript');
 
