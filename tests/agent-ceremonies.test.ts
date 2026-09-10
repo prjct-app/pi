@@ -94,9 +94,7 @@ test('ship refuses with open tasks and completes the work when the assessment is
 
     const { checkoutId } = await ids();
     await runtime.execute('prjct_task', { action: 'claim', workId, taskId: 't1', checkoutId, access: 'write', operationId: 'op_c', expectedRevision: await rev(), maxBytes: 4096 }, { confirm: async () => true });
-    await observeNative(runtime);
-    const state = await readRecord(join(scopeStore(runtime.prjctRoot, (await ids()).key, 'work'), 'state.json'));
-    const obsId = (state!.payload as { observations: Array<{ id: string }> }).observations[0]!.id;
+    const obsId = await observeNative(runtime);
     const assessment = await runtime.execute('prjct_checkpoint', {
       action: 'record', workId, taskId: 't1', kind: 'assessment', planRevision: 0, definitionRevision: 1,
       judgments: [{ criterionId: 'c1', conclusion: 'satisfied', evidenceIds: [obsId], rationale: 'pass' }],

@@ -22,7 +22,8 @@ async function setup(t: { after: (fn: () => Promise<void>) => void }) {
   await runtime.initProject();
   await runtime.syncProject();
   const id=await runtime.identity();const statePath=join(prjctHome,id.day,id.projectId,'work/state.json');
-  const record=()=>readRecord(statePath);const rev=async()=>(await record())!.revision;
+  const record=async()=>{const stored=(await readRecord(statePath))!;return {...stored,payload:{...stored.payload as object,observations:[...await runtime.readObservations()]} as unknown};};
+  const rev=async()=>(await record()).revision;
   let n=0;const mutation=async()=>({operationId:`regression_${++n}`,expectedRevision:await rev(),maxBytes:24000});
   return {root,cwd,agentHome,prjctHome,runtime,id,statePath,record,rev,mutation};
 }

@@ -9,6 +9,7 @@ import { fauxProvider, fauxAssistantMessage, fauxToolCall, InMemoryCredentialSto
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type AgentSession } from '@earendil-works/pi-coding-agent';
 import extension from '../src/extension.ts';
 import { readRecord } from '../src/workspace/store.ts';
+import { ProcessRuntime } from '../src/pi/process-runtime.ts';
 
 // Only the model is scripted. Native read/bash, command dispatch, deferred tool
 // activation, observation hooks and separate Pi sessions execute for real.
@@ -63,8 +64,11 @@ test('Pi init connects and indexes headlessly, analyze synthesizes supported con
   const index = (await readRecord(join(home, 'identity/index.json')))!.payload as { bindings: Array<{ day: string; projectId: string }> };
   const b = index.bindings[0]!;
   const statePath = join(home, b.day, b.projectId, 'work/state.json');
-  const state = () => readRecord(statePath).then(r => r!.payload as { claims: Array<{ standing: string }>; observations: Array<{ id: string; provenance: string; verification: boolean;
-    attemptId?: string; sessionId?: string; checkoutId?: string; execution: { command?: string; toolCallId: string; outcome: string; coverage?: string } }> });
+  const observer = new ProcessRuntime({ cwd, agentHome: agentDir, prjctHome: home, sessionId: 'test_observer' });
+  const state = async () => ({
+    ...((await readRecord(statePath))!.payload as { claims: Array<{ standing: string }> }),
+    observations: [...await observer.readObservations()],
+  });
   assert.match((await readRecord(join(home, b.day, b.projectId, 'knowledge/context/purpose.json')))?.payload ? JSON.stringify((await readRecord(join(home, b.day, b.projectId, 'knowledge/context/purpose.json')))!.payload) : '', /# Purpose/);
   await first.prompt('/prjct work repair scheduling');
   faux.setResponses([
@@ -90,8 +94,8 @@ test('Pi init connects and indexes headlessly, analyze synthesizes supported con
   assert.deepEqual(errors, []);
   const observation = (await state()).observations.find(o => o.execution?.command === 'node --test check.test.mjs');
   assert.equal(observation?.provenance, 'native_observation'); assert.equal(observation?.verification, true);
-  assert.equal(observation?.execution.outcome, 'succeeded'); assert.ok(observation?.execution.toolCallId);
-  assert.equal(observation?.execution.coverage, 'partial', 'bash never claims full filesystem/sandbox coverage');
+  assert.equal(observation?.execution?.outcome, 'succeeded'); assert.ok(observation?.execution?.toolCallId);
+  assert.equal(observation?.execution?.coverage, 'partial', 'bash never claims full filesystem/sandbox coverage');
   assert.ok(observation?.attemptId && observation?.sessionId && observation?.checkoutId, 'evidence is bound to host lifecycle identity');
   const beforeCount = faux.state.callCount;
   await first.prompt('/prjct sync'); await first.agent.waitForIdle();

@@ -59,7 +59,11 @@ test('tight budgets trim method documents with an explicit gap instead of preten
 test('method gates are wired through the real tool: review, grilling, diagnosis, reuse', async t => {
   const runtime = await setup(t);
   await runtime.initProject();
-  const state = async () => (await import('../src/workspace/store.ts')).readRecord(join((runtime as never as { prjctRoot: string }).prjctRoot, (await runtime.identity()).day, (await runtime.identity()).projectId, 'work/state.json')).then(r => (r!.payload as { revision: number; observations: Array<{ id: string; execution?: { toolName: string; outcome: string } }> }));
+  const state = async () => {
+    const stored = await (await import('../src/workspace/store.ts')).readRecord(join((runtime as never as { prjctRoot: string }).prjctRoot,
+      (await runtime.identity()).day, (await runtime.identity()).projectId, 'work/state.json'));
+    return { ...(stored!.payload as { revision: number }), observations: [...await runtime.readObservations()] };
+  };
   const mutation = async () => ({ expectedRevision: (await state()).revision, operationId: `m_${Math.random().toString(36).slice(2)}`, maxBytes: 24000 });
   const origin = { id: 'src_readme', revision: 1, contentHash: 'a'.repeat(64) };
   const work = await runtime.execute('prjct_work', { action: 'create', projectId: (await runtime.identity()).projectId, title: 'Method gates', origin, operationId: 'gate_work', maxBytes: 24000 });
