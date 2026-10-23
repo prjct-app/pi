@@ -5,7 +5,7 @@
   "type": "module",
   "description": "prjct: persistent project understanding, method discipline, and cross-session continuity for Pi. Explicit init, on-demand methods, evidence-gated work.",
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=22.23.4"
   },
   "scripts": {
     "check": "tsc --noEmit",
